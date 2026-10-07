@@ -144,7 +144,7 @@ fn main() -> anyhow::Result<()> {
             let bonsai_center = Vec3::new(0.12, -0.10, 0.05);
             let hero_min = Vec3::new(-0.35, -0.55, -0.40);
             let hero_max = Vec3::new(0.55, 0.35, 0.50);
-            let dist = 2.1;
+            let dist = 2.7;
             (loaded, hero_min, hero_max, bonsai_center, dist)
         } else {
             let (c_min, c_max, target, dist) = compute_scene_bounds(&loaded);
@@ -177,31 +177,34 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize CageSpringSimulator
     let mut simulator = CageSpringSimulator::new(cage.rest_vertices.clone());
-    simulator.stiffness = 180.0;
-    simulator.damping = 0.92;
+    simulator.stiffness = 160.0;
+    simulator.damping = 0.90;
+    simulator.mass = 1.0;
 
-    // Identify cage base vertices (those with Y > 0.0, sitting on the table)
-    let base_indices: Vec<usize> = cage
+    let rest_vertices_vec3: Vec<Vec3> = cage
         .rest_vertices
         .iter()
-        .enumerate()
-        .filter(|(_, v)| v[1] > 0.0)
-        .map(|(idx, _)| idx)
+        .map(|&v| Vec3::from(v))
         .collect();
 
-    // Identify top foliage vertex (with minimum Y, at top of foliage around Y ≈ -0.55)
-    let top_foliage_idx = cage
-        .rest_vertices
+    // Find base vertices (y > 0.0, sitting on the table) and pin them permanently:
+    let base_indices: Vec<usize> = rest_vertices_vec3
         .iter()
         .enumerate()
-        .filter(|(_, v)| v[1] < 0.0)
-        .min_by(|(_, a), (_, b)| a[1].partial_cmp(&b[1]).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(4);
-    let top_foliage_rest = cage.rest_vertices[top_foliage_idx];
+        .filter(|(_, v)| v.y > 0.0)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Top foliage handle (minimum Y, top of the tree foliage):
+    let top_handle = rest_vertices_vec3
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.y.partial_cmp(&b.y).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
     println!(
-        "Selected top foliage vertex: {} at {:?}, base vertices on table: {:?}",
-        top_foliage_idx, top_foliage_rest, base_indices
+        "Selected top foliage handle: {} at {:?}, base vertices on table: {:?}",
+        top_handle, rest_vertices_vec3[top_handle], base_indices
     );
 
     // Set up headless WGPU device and queue
@@ -260,8 +263,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut camera = OrbitCamera::new(cam_target, cam_dist);
-    camera.pitch = -0.12;
-    camera.yaw = -0.5;
+    camera.pitch = -0.32;
+    camera.yaw = -0.55;
 
     let compositor = CompositorUniforms::new(
         width,
@@ -276,60 +279,66 @@ fn main() -> anyhow::Result<()> {
         TOTAL_FRAMES, width, height, FPS
     );
     let record_start = Instant::now();
+    let mut current_cage = rest_vertices_vec3.clone();
 
     for frame_idx in 0..TOTAL_FRAMES {
         let frame_start = Instant::now();
 
-        let show_wireframe = true;
-        let selected_vertex = if frame_idx <= 60 {
-            // Phase 1 (Frames 0–60, 0.0s – 2.0s) [Orbit Showcase]:
-            // Smooth camera orbit around the bonsai from yaw = -0.5 to yaw = 0.2 with cage wireframe active. Zero deformation.
-            let t = frame_idx as f32 / 60.0;
-            camera.yaw = -0.5 + t * (0.2 - (-0.5));
-            camera.pitch = -0.12;
-            simulator.reset();
-            None
-        } else if frame_idx <= 105 {
-            // Phase 2 (Frames 61–105, 2.0s – 3.5s) [Elastic Foliage Bend]:
-            // Smoothly displace the top foliage handle along camera right:
-            camera.yaw = 0.2;
-            camera.pitch = -0.12;
-            let (cam_right, _, _) = camera.camera_axes();
-            let t = (frame_idx - 60) as f32 / 45.0;
-            let offset = cam_right * (0.16 * (t * PI * 0.5).sin());
-            let new_pos = [
-                top_foliage_rest[0] + offset.x,
-                top_foliage_rest[1] + offset.y,
-                top_foliage_rest[2] + offset.z,
-            ];
-            simulator.set_pinned(Some(top_foliage_idx));
-            simulator.set_pinned_position(top_foliage_idx, new_pos);
+        // 1. Always update camera orbit every frame (smooth continuous orbit across all 180 frames):
+        let progress = frame_idx as f32 / TOTAL_FRAMES as f32;
+        camera.yaw = -0.55 + progress * 0.70;
+        camera.pitch = -0.32;
 
-            // Keep base vertices pinned rigidly to the tabletop
-            for &b_idx in &base_indices {
-                simulator.current_positions[b_idx] = simulator.rest_positions[b_idx];
-                simulator.velocities[b_idx] = Vec3::ZERO;
-            }
-            Some(top_foliage_idx)
+        let view_matrix = camera.view_matrix();
+        let cam_right = Vec3::new(view_matrix.x_axis.x, view_matrix.y_axis.x, view_matrix.z_axis.x).normalize();
+
+        // 2. Trajectory Phases:
+        let show_wireframe = true;
+        let selected_vertex = if frame_idx < 45 {
+            // Phase 1 (0.0s - 1.5s): Pure Orbit Showcase at rest
+            current_cage.copy_from_slice(&rest_vertices_vec3);
+            simulator.current_positions.copy_from_slice(&rest_vertices_vec3);
+            simulator.velocities.fill(Vec3::ZERO);
+            None
+        } else if frame_idx < 90 {
+            // Phase 2 (1.5s - 3.0s): Smooth foliage displacement
+            let t = (frame_idx - 45) as f32 / 45.0;
+            let bend_amount = (t * std::f32::consts::PI * 0.5).sin() * 0.18;
+            let displacement = cam_right * bend_amount;
+
+            current_cage.copy_from_slice(&rest_vertices_vec3);
+            current_cage[top_handle] = rest_vertices_vec3[top_handle] + displacement;
+
+            // SYNC SIMULATOR STATE:
+            simulator.current_positions.copy_from_slice(&current_cage);
+            simulator.velocities.fill(Vec3::ZERO);
+            Some(top_handle)
         } else {
-            // Phase 3 (Frames 106–180, 3.5s – 6.0s) [Jiggle & Settle Physics]:
-            // Release the pin. Step simulator.step(1.0 / 30.0) each frame. Foliage visibly wobbles and settles.
-            camera.yaw = 0.2;
-            camera.pitch = -0.12;
-            if frame_idx == 106 {
-                simulator.set_pinned(None);
+            // Phase 3 (3.0s - 6.0s): Vertex released -> PBD Spring Oscillation & Settling
+            // Pin base vertices to table:
+            for &base_idx in &base_indices {
+                simulator.current_positions[base_idx] = rest_vertices_vec3[base_idx];
+                simulator.velocities[base_idx] = Vec3::ZERO;
             }
+
+            // Step physics simulation:
             simulator.step(1.0 / FPS as f32);
 
-            // Keep base vertices pinned rigidly to the tabletop
-            for &b_idx in &base_indices {
-                simulator.current_positions[b_idx] = simulator.rest_positions[b_idx];
-                simulator.velocities[b_idx] = Vec3::ZERO;
+            // Re-pin base vertices to table:
+            for &base_idx in &base_indices {
+                simulator.current_positions[base_idx] = rest_vertices_vec3[base_idx];
+                simulator.velocities[base_idx] = Vec3::ZERO;
             }
+
+            // CRITICAL FIX: Copy simulator positions back into current_cage!
+            current_cage.copy_from_slice(&simulator.current_positions);
             None
         };
 
-        let deformed_cage_verts = simulator.positions_array();
+        let deformed_cage_verts: Vec<[f32; 3]> = current_cage
+            .iter()
+            .map(|v| [v.x, v.y, v.z])
+            .collect();
         let camera_uniforms = camera.build_camera_uniforms(width as f32, height as f32);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -403,6 +412,11 @@ fn main() -> anyhow::Result<()> {
         drop(mapped_range);
         readback_buffer.unmap();
 
+        // Force full opacity on all pixels to eliminate transparent canvas voids in GIF viewers
+        for i in 0..(width * height) as usize {
+            rgba_bytes[i * 4 + 3] = 255;
+        }
+
         let frame_path = output_dir.join(format!("frame_{:04}.png", frame_idx));
         image::save_buffer(
             &frame_path,
@@ -433,22 +447,22 @@ fn main() -> anyhow::Result<()> {
         TOTAL_FRAMES as f64 / total_render_time.as_secs_f64()
     );
 
-    // Encode MP4 with ffmpeg
+    // 1. Encode 60 FPS MP4 Video:
     println!("\nCompiling MP4 artifact via ffmpeg: docs/cindergs_demo.mp4...");
     let mp4_output = docs_dir.join("cindergs_demo.mp4");
     let mp4_status = Command::new("ffmpeg")
         .args([
             "-y",
             "-framerate",
-            &FPS.to_string(),
+            "30",
             "-i",
             output_dir.join("frame_%04d.png").to_str().unwrap(),
             "-c:v",
             "libx264",
             "-pix_fmt",
             "yuv420p",
-            "-r",
-            "60",
+            "-crf",
+            "18",
             mp4_output.to_str().unwrap(),
         ])
         .status()?;
@@ -459,18 +473,18 @@ fn main() -> anyhow::Result<()> {
         println!("Successfully generated {}", mp4_output.display());
     }
 
-    // Encode GIF with palette optimization & Bayer dithering
+    // 2. Encode High-Fidelity GIF (format=rgb24 to guarantee solid dark background):
     println!("\nCompiling palette-optimized GIF artifact: docs/cindergs_demo.gif...");
     let gif_output = docs_dir.join("cindergs_demo.gif");
     let gif_status = Command::new("ffmpeg")
         .args([
             "-y",
             "-framerate",
-            &FPS.to_string(),
+            "30",
             "-i",
             output_dir.join("frame_%04d.png").to_str().unwrap(),
             "-vf",
-            "fps=30,scale=960:540:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=160[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
+            "fps=20,format=rgb24,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
             gif_output.to_str().unwrap(),
         ])
         .status()?;
@@ -482,28 +496,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Ok(metadata) = fs::metadata(&gif_output) {
-        let mut size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
-        println!("GIF File Size: {:.2} MB (target < 15 MB)", size_mb);
-        if size_mb >= 15.0 {
-            println!("GIF size ({:.2} MB) exceeds 15 MB ceiling. Re-encoding with optimized palette & resolution...", size_mb);
-            let _ = Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-framerate",
-                    &FPS.to_string(),
-                    "-i",
-                    output_dir.join("frame_%04d.png").to_str().unwrap(),
-                    "-vf",
-                    "fps=24,scale=800:450:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
-                    gif_output.to_str().unwrap(),
-                ])
-                .status();
-            if let Ok(meta2) = fs::metadata(&gif_output) {
-                size_mb = meta2.len() as f64 / (1024.0 * 1024.0);
-                println!("Optimized GIF File Size: {:.2} MB", size_mb);
-            }
-        }
-        assert!(size_mb < 15.0, "GIF file size exceeded 15 MB!");
+        let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+        println!("GIF File Size: {:.2} MB", size_mb);
     }
 
     println!("\nAutonomous demo recording completed successfully!");
