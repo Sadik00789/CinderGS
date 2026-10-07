@@ -28,7 +28,7 @@
 3. **Real-Time Volumetric Cage Kinematics & Hero Isolation:**
    - Arbitrary mesh deformation using a localized 5-tetrahedron hero cage with barycentric coordinates $\mathbf{w}_i = (w_0, w_1, w_2, w_3)$ and `u32::MAX` sentinel handling that keeps background splats 100% static and opaque.
    - Affine covariance deformation: $\Sigma' = J \Sigma_{\text{rest}} J^T$ computed per splat.
-   - Energy-conserving volumetric opacity stabilization: hard-bounded volume dilation $\alpha' = 1 - (1 - \alpha)^{1 / s_{\det}}$ ($s_{\det} = \operatorname{clamp}(\det(J), 0.6, 1.8)$), preventing stretched splats from evaporating into transparency.
+   - Energy-conserving volumetric opacity stabilization: hard-bounded volume dilation $\alpha' = 1 - (1 - \alpha)^{1 / s_{\text{det}}}$ $(s_{\text{det}} = \mathrm{clamp}(\det(J), 0.6, 1.8))$, preventing stretched splats from evaporating into transparency.
 4. **Inverse-Ray Spherical Harmonics Evaluation:**
    - Rotates the viewing direction into local tetrahedral reference coordinates $(\mathbf{d}_ {\text{local}} = R^T \mathbf{d}_ {\text{world}})$ using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
 5. **Cooperative Shared-Memory Tile Compositor:**
@@ -297,3 +297,10 @@ Programmatically executes the 120-frame trajectory (360° orbit, top handle defo
 - **Spring Damping (0.50 – 0.99):** Control oscillation settling rate.
 - **Trigger Jiggle Impulse:** Perturb all unpinned cage vertices radially outward with an explosive velocity pulse.
 - **Reset Cage / Reset Camera:** Restore rest lattice topology or orbit view.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+

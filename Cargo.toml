@@ -3,6 +3,7 @@ name = "cinder_gs"
 version = "0.1.0"
 edition = "2024"
 authors = ["CinderGS Engine Team"]
+license = "MIT"
 description = "High-performance production-grade 3D Gaussian Splatting engine core"
 
 [dependencies]
