@@ -25,12 +25,12 @@
    - Affine covariance deformation: $\Sigma' = J \Sigma_{\text{rest}} J^T$ computed per splat.
    - Energy-conserving volumetric opacity adjustment: $\alpha' = 1 - (1 - \alpha)^{1 / \det(J)}$.
 4. **Inverse-Ray Spherical Harmonics Evaluation:**
-   - Rotates the viewing direction into local tetrahedral reference coordinates ($\mathbf{d}_{\text{local}} = R^T \mathbf{d}_{\text{world}}$) using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
+   - Rotates the viewing direction into local tetrahedral reference coordinates $(\mathbf{d}_ {\text{local}} = R^T \mathbf{d}_ {\text{world}})$ using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
 5. **Cooperative Shared-Memory Tile Compositor:**
    - Viewport partitioned into $16 \times 16$ pixel workgroups.
-   - 256-thread cooperative tile fetching into GPU shared memory with deadlock-free barrier synchronization and early ray termination ($\mathcal{T} < 10^{-4}$).
+   - 256-thread cooperative tile fetching into GPU shared memory with deadlock-free barrier synchronization and early ray termination $(\mathcal{T} < 10^{-4})$.
 6. **Damped Spring Cage Dynamics:**
-   - Interactive Hookean spring physics with timestep clamping ($\Delta t_{\text{sim}} \le 0.033\text{ s}$) preventing numerical instability during hitching.
+   - Interactive Hookean spring physics with timestep clamping $(\Delta t_{\text{sim}} \le 0.033\text{ s})$ preventing numerical instability during hitching.
    - Unpinned vertices physically oscillate and settle when dragged cage handles are released, accompanied by radial jiggle impulse perturbations.
 
 ---
