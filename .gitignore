@@ -1,0 +1,5 @@
+/target
+*.ply
+.DS_Store
+*.swp
+*.log
