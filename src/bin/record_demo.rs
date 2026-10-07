@@ -123,21 +123,29 @@ fn main() -> anyhow::Result<()> {
     let (scene, cage_min, cage_max, cam_target, cam_dist) = if ply_path.exists() {
         println!("Loading canonical 3DGS asset from '{}'...", ply_path.display());
         let t0 = Instant::now();
-        let loaded = PlyLoader::load_file(&ply_path)?;
+        let mut loaded = PlyLoader::load_file(&ply_path)?;
         println!(
             "Successfully ingested {} Gaussians in {:.2} ms",
             loaded.len(),
             t0.elapsed().as_secs_f64() * 1000.0
         );
         if loaded.len() > 500_000 {
-            // Canonical Bonsai scene: localized hero cage focused strictly on the central model
-            let center = Vec3::new(0.16, 1.49, 2.25);
-            let hero_offset_min = Vec3::new(-0.7, -0.6, -0.7);
-            let hero_offset_max = Vec3::new(0.7, 0.8, 0.7);
-            let c_min = center + hero_offset_min;
-            let c_max = center + hero_offset_max;
-            let dist = 3.2;
-            (loaded, c_min, c_max, center, dist)
+            // True centroid of the bonsai tree + pot in Mip-NeRF 360 dataset.
+            // Raw Inria COLMAP coordinates have the dense flower cluster at (0.38, 0.88, 1.35).
+            // Translate the entire scene rigidly so the bonsai tree is centered at (0.12, -0.10, 0.05),
+            // tabletop at y ≈ 0.35, tablecloth at y ≈ 0.90, and floor at y ≈ 1.50.
+            let shift = Vec3::new(0.12 - 0.38, -0.10 - 0.88, 0.05 - 1.35);
+            for i in 0..loaded.count {
+                loaded.positions[i * 3] += shift.x;
+                loaded.positions[i * 3 + 1] += shift.y;
+                loaded.positions[i * 3 + 2] += shift.z;
+            }
+
+            let bonsai_center = Vec3::new(0.12, -0.10, 0.05);
+            let hero_min = Vec3::new(-0.35, -0.55, -0.40);
+            let hero_max = Vec3::new(0.55, 0.35, 0.50);
+            let dist = 2.1;
+            (loaded, hero_min, hero_max, bonsai_center, dist)
         } else {
             let (c_min, c_max, target, dist) = compute_scene_bounds(&loaded);
             (loaded, c_min, c_max, target, dist)
@@ -172,16 +180,29 @@ fn main() -> anyhow::Result<()> {
     simulator.stiffness = 180.0;
     simulator.damping = 0.92;
 
-    // Identify top cage vertex handle (vertex with max Y)
-    let top_handle_idx = cage
+    // Identify cage base vertices (those with Y > 0.0, sitting on the table)
+    let base_indices: Vec<usize> = cage
         .rest_vertices
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a[1].partial_cmp(&b[1]).unwrap())
+        .filter(|(_, v)| v[1] > 0.0)
         .map(|(idx, _)| idx)
-        .unwrap_or(6);
-    let top_handle_rest = cage.rest_vertices[top_handle_idx];
-    println!("Selected top vertex handle index: {} at {:?}", top_handle_idx, top_handle_rest);
+        .collect();
+
+    // Identify top foliage vertex (with minimum Y, at top of foliage around Y ≈ -0.55)
+    let top_foliage_idx = cage
+        .rest_vertices
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v[1] < 0.0)
+        .min_by(|(_, a), (_, b)| a[1].partial_cmp(&b[1]).unwrap())
+        .map(|(idx, _)| idx)
+        .unwrap_or(4);
+    let top_foliage_rest = cage.rest_vertices[top_foliage_idx];
+    println!(
+        "Selected top foliage vertex: {} at {:?}, base vertices on table: {:?}",
+        top_foliage_idx, top_foliage_rest, base_indices
+    );
 
     // Set up headless WGPU device and queue
     println!("Initializing headless WGPU device & queue...");
@@ -239,9 +260,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut camera = OrbitCamera::new(cam_target, cam_dist);
-    camera.pitch = 0.20;
-    let initial_yaw = 0.0;
-    camera.yaw = initial_yaw;
+    camera.pitch = -0.12;
+    camera.yaw = -0.5;
 
     let compositor = CompositorUniforms::new(
         width,
@@ -261,35 +281,51 @@ fn main() -> anyhow::Result<()> {
         let frame_start = Instant::now();
 
         let show_wireframe = true;
-        let selected_vertex = if frame_idx <= 45 {
-            // Stage 1 (Frames 0–45): Smooth 45° orbit around the central model with cage wireframe visible
-            let orbit_progress = frame_idx as f32 / 45.0;
-            camera.yaw = initial_yaw + orbit_progress * (PI / 4.0);
+        let selected_vertex = if frame_idx <= 60 {
+            // Phase 1 (Frames 0–60, 0.0s – 2.0s) [Orbit Showcase]:
+            // Smooth camera orbit around the bonsai from yaw = -0.5 to yaw = 0.2 with cage wireframe active. Zero deformation.
+            let t = frame_idx as f32 / 60.0;
+            camera.yaw = -0.5 + t * (0.2 - (-0.5));
+            camera.pitch = -0.12;
             simulator.reset();
             None
-        } else if frame_idx <= 90 {
-            // Stage 2 (Frames 46–90): Horizontal tree displacement along the camera-plane X axis:
-            // Δx = u * (0.20 * sin((f - 45) * π / 45))
-            camera.yaw = initial_yaw + (PI / 4.0);
+        } else if frame_idx <= 105 {
+            // Phase 2 (Frames 61–105, 2.0s – 3.5s) [Elastic Foliage Bend]:
+            // Smoothly displace the top foliage handle along camera right:
+            camera.yaw = 0.2;
+            camera.pitch = -0.12;
             let (cam_right, _, _) = camera.camera_axes();
-            let progress = (frame_idx - 45) as f32 / 45.0;
-            let disp = 0.20 * (progress * std::f32::consts::FRAC_PI_2).sin();
-            let delta_x = cam_right * disp;
+            let t = (frame_idx - 60) as f32 / 45.0;
+            let offset = cam_right * (0.16 * (t * PI * 0.5).sin());
             let new_pos = [
-                top_handle_rest[0] + delta_x.x,
-                top_handle_rest[1] + delta_x.y,
-                top_handle_rest[2] + delta_x.z,
+                top_foliage_rest[0] + offset.x,
+                top_foliage_rest[1] + offset.y,
+                top_foliage_rest[2] + offset.z,
             ];
-            simulator.set_pinned(Some(top_handle_idx));
-            simulator.set_pinned_position(top_handle_idx, new_pos);
-            Some(top_handle_idx)
+            simulator.set_pinned(Some(top_foliage_idx));
+            simulator.set_pinned_position(top_foliage_idx, new_pos);
+
+            // Keep base vertices pinned rigidly to the tabletop
+            for &b_idx in &base_indices {
+                simulator.current_positions[b_idx] = simulator.rest_positions[b_idx];
+                simulator.velocities[b_idx] = Vec3::ZERO;
+            }
+            Some(top_foliage_idx)
         } else {
-            // Stage 3 (Frames 91–180): Pin is released. Step CageSpringSimulator::step(1.0 / 30.0) every frame so the foliage visibly oscillates and settles back to rest
-            camera.yaw = initial_yaw + (PI / 4.0);
-            if frame_idx == 91 {
+            // Phase 3 (Frames 106–180, 3.5s – 6.0s) [Jiggle & Settle Physics]:
+            // Release the pin. Step simulator.step(1.0 / 30.0) each frame. Foliage visibly wobbles and settles.
+            camera.yaw = 0.2;
+            camera.pitch = -0.12;
+            if frame_idx == 106 {
                 simulator.set_pinned(None);
             }
             simulator.step(1.0 / FPS as f32);
+
+            // Keep base vertices pinned rigidly to the tabletop
+            for &b_idx in &base_indices {
+                simulator.current_positions[b_idx] = simulator.rest_positions[b_idx];
+                simulator.velocities[b_idx] = Vec3::ZERO;
+            }
             None
         };
 

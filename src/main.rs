@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             println!("Ingesting 3DGS binary PLY from '{}' via memory-mapped parser...", path.display());
             let load_timer = std::time::Instant::now();
-            let loaded_scene = PlyLoader::load_file(path)?;
+            let mut loaded_scene = PlyLoader::load_file(path)?;
             let load_elapsed = load_timer.elapsed();
             println!("Loaded {} Gaussians in {:.2} ms", loaded_scene.len(), load_elapsed.as_secs_f64() * 1000.0);
 
@@ -97,17 +97,29 @@ fn main() -> anyhow::Result<()> {
                 max_pos = Vec3::splat(0.5);
             }
 
-            let hero_center = if loaded_scene.len() > 500_000 {
-                Vec3::new(0.16, 1.49, 2.25)
+            let (hero_center, hero_min, hero_max, cam_dist) = if loaded_scene.len() > 500_000 {
+                // True centroid of the bonsai tree + pot in Mip-NeRF 360 dataset.
+                // Raw Inria COLMAP coordinates have the dense flower cluster at (0.38, 0.88, 1.35).
+                // Translate the entire scene rigidly so the bonsai tree is centered at (0.12, -0.10, 0.05),
+                // tabletop at y ≈ 0.35, tablecloth at y ≈ 0.90, and floor at y ≈ 1.50.
+                let shift = Vec3::new(0.12 - 0.38, -0.10 - 0.88, 0.05 - 1.35);
+                for i in 0..loaded_scene.count {
+                    loaded_scene.positions[i * 3] += shift.x;
+                    loaded_scene.positions[i * 3 + 1] += shift.y;
+                    loaded_scene.positions[i * 3 + 2] += shift.z;
+                }
+
+                let bonsai_center = Vec3::new(0.12, -0.10, 0.05);
+                let hero_min = Vec3::new(-0.35, -0.55, -0.40);
+                let hero_max = Vec3::new(0.55, 0.35, 0.50);
+                (bonsai_center, hero_min, hero_max, 2.1f32)
             } else if loaded_scene.count > 0 {
-                (min_pos + max_pos) * 0.5
+                let center = (min_pos + max_pos) * 0.5;
+                (center, center + Vec3::new(-0.7, -0.6, -0.7), center + Vec3::new(0.7, 0.8, 0.7), 3.2f32)
             } else {
-                Vec3::ZERO
+                (Vec3::ZERO, Vec3::new(-0.7, -0.6, -0.7), Vec3::new(0.7, 0.8, 0.7), 2.5f32)
             };
 
-            // Define hero bounds focused strictly on the central model
-            let hero_min = hero_center + Vec3::new(-0.7, -0.6, -0.7);
-            let hero_max = hero_center + Vec3::new(0.7, 0.8, 0.7);
             println!("Hero Center: {:?}, Hero Bounds: [{:?}, {:?}]", hero_center, hero_min, hero_max);
             println!("Constructing 5-tetrahedron localized hero cage...");
             let tet_cage = TetMesh::create_box_cage(hero_min.to_array(), hero_max.to_array());
@@ -128,7 +140,7 @@ fn main() -> anyhow::Result<()> {
                 bind_elapsed.as_secs_f64() * 1000.0
             );
 
-            (loaded_scene, tet_cage, tet_bindings, hero_center, 3.2f32)
+            (loaded_scene, tet_cage, tet_bindings, hero_center, cam_dist)
         }
     } else {
         println!("No PLY file specified. Generating procedural synthetic cluster (2,000 Gaussians in unit cage)...");
@@ -138,6 +150,7 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = CinderApp::new(scene, Some(cage), Some(bindings));
     app.camera = OrbitCamera::new(cam_target, cam_dist);
+    app.camera.pitch = -0.12;
 
     println!("Starting CinderGS engine window...");
     event_loop.run_app(&mut app)?;
