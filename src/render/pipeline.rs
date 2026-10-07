@@ -180,7 +180,12 @@ impl RenderPipelineOrchestrator {
             ));
         }
 
-        let client = Device::default().client();
+        let client = {
+            let dev = Device::Wgpu(cubecl::wgpu::WgpuDevice::new(
+                cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0),
+            ));
+            std::panic::catch_unwind(|| dev.client()).unwrap_or_else(|_| Device::default().client())
+        };
 
         // 1. Stage 1: Volumetric deformation (if cage provided)
         let (pos_bytes, cov_bytes, opa_bytes, sh_bytes) = if let (

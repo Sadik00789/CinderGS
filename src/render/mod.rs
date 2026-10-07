@@ -240,7 +240,12 @@ pub fn project_scene_wgpu(
         return Ok(ProjectionOutputs::empty());
     }
 
-    let client = Device::default().client();
+    let client = {
+        let dev = Device::Wgpu(cubecl::wgpu::WgpuDevice::new(
+            cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0),
+        ));
+        std::panic::catch_unwind(|| dev.client()).unwrap_or_else(|_| Device::default().client())
+    };
 
     // Upload positions, covariances, and camera uniforms
     let pos_handle = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(scene.positions_bytes().to_vec()));

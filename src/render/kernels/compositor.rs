@@ -75,6 +75,9 @@ pub fn tile_compositor_kernel(
     let total_in_tile = range_end - range_start;
     let num_batches = (total_in_tile + 255u32) / 256u32;
 
+    let pix_center_x = px as f32 + 0.5f32;
+    let pix_center_y = py as f32 + 0.5f32;
+
     for b in 0u32..num_batches {
         // Step 1: Cooperative loading into shared memory
         let entry_idx = range_start + b * 256u32 + local_id_u32;
@@ -138,37 +141,40 @@ pub fn tile_compositor_kernel(
         // Step 2: Conic evaluation and alpha blending
         let batch_count = u32::min(256u32, total_in_tile - b * 256u32);
 
-        for k in 0u32..batch_count {
-            if inside_screen && !saturated {
-                let mu_x = shared_xy_x[k as usize];
-                let mu_y = shared_xy_y[k as usize];
+        if inside_screen && !saturated {
+            for k in 0u32..batch_count {
+                let op_base = shared_opacity[k as usize];
+                if op_base > 0.003921569f32 {
+                    let mu_x = shared_xy_x[k as usize];
+                    let mu_y = shared_xy_y[k as usize];
 
-                let dx = (px as f32 + 0.5f32) - mu_x;
-                let dy = (py as f32 + 0.5f32) - mu_y;
+                    let dx = pix_center_x - mu_x;
+                    let dy = pix_center_y - mu_y;
 
-                let a = shared_conic_a[k as usize];
-                let b_coef = shared_conic_b[k as usize];
-                let c = shared_conic_c[k as usize];
+                    let a = shared_conic_a[k as usize];
+                    let b_coef = shared_conic_b[k as usize];
+                    let c = shared_conic_c[k as usize];
 
-                let mut q = -0.5f32 * (a * dx * dx + 2.0f32 * b_coef * dx * dy + c * dy * dy);
-                if q > 0.0f32 {
-                    q = 0.0f32;
-                }
+                    let mut q = -0.5f32 * (a * dx * dx + 2.0f32 * b_coef * dx * dy + c * dy * dy);
+                    if q > 0.0f32 {
+                        q = 0.0f32;
+                    }
 
-                if q >= -4.0f32 {
-                    let op_base = shared_opacity[k as usize];
-                    let alpha = f32::min(0.99f32, op_base * f32::exp(q));
+                    if q >= -4.0f32 {
+                        let alpha = f32::min(0.99f32, op_base * f32::exp(q));
 
-                    if alpha >= 0.003921569f32 {
-                        let w = alpha * t;
-                        c_r += w * shared_rgb_r[k as usize];
-                        c_g += w * shared_rgb_g[k as usize];
-                        c_b += w * shared_rgb_b[k as usize];
+                        if alpha >= 0.003921569f32 {
+                            let w = alpha * t;
+                            c_r += w * shared_rgb_r[k as usize];
+                            c_g += w * shared_rgb_g[k as usize];
+                            c_b += w * shared_rgb_b[k as usize];
 
-                        t *= 1.0f32 - alpha;
-                        if t < 0.001f32 {
-                            saturated = true;
-                            t = 0.0f32;
+                            t *= 1.0f32 - alpha;
+                            if t < 0.001f32 {
+                                saturated = true;
+                                t = 0.0f32;
+                                break;
+                            }
                         }
                     }
                 }
