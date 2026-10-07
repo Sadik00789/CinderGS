@@ -243,6 +243,9 @@ impl RenderPipelineOrchestrator {
             let bind_weights_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
                 bytemuck::cast_slice(&bind_weights).to_vec(),
             ));
+            let rest_pos_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
+                scene.positions_bytes().to_vec(),
+            ));
             let rest_cov_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
                 scene.covariances_bytes().to_vec(),
             ));
@@ -267,6 +270,7 @@ impl RenderPipelineOrchestrator {
             let rot_arg = unsafe { BufferArg::from_raw_parts(rot_handle, num_tets as usize * 9) };
             let bind_t_arg = unsafe { BufferArg::from_raw_parts(bind_tets_h, bind_tets.len()) };
             let bind_w_arg = unsafe { BufferArg::from_raw_parts(bind_weights_h, bind_weights.len()) };
+            let r_pos_arg = unsafe { BufferArg::from_raw_parts(rest_pos_h, count * 3) };
             let r_cov_arg = unsafe { BufferArg::from_raw_parts(rest_cov_h, count * 6) };
             let r_opa_arg = unsafe { BufferArg::from_raw_parts(rest_opa_h, count) };
             let sh_arg = unsafe { BufferArg::from_raw_parts(sh_h, count * 48) };
@@ -285,6 +289,7 @@ impl RenderPipelineOrchestrator {
                 rot_arg,
                 bind_t_arg,
                 bind_w_arg,
+                r_pos_arg,
                 r_cov_arg,
                 r_opa_arg,
                 sh_arg,
@@ -297,6 +302,7 @@ impl RenderPipelineOrchestrator {
                 camera.view_matrix[14],
                 compositor.sh_degree,
                 count as u32,
+                num_tets,
             );
 
             let pos_bytes = client

@@ -1159,9 +1159,11 @@ fn test_deliverable_deformation_uniform_scaling() {
     assert!((output.scene.covariances_3d[3] - expected_cov_diag).abs() < 1e-4);
     assert!((output.scene.covariances_3d[5] - expected_cov_diag).abs() < 1e-4);
 
-    // 3. Opacity scaled: det(J) = s^3 = 8.0, base = 1 - 0.8 = 0.2, alpha' = 1 - 0.2^(1/8)
+    // 3. Opacity scaled with bounded volume dilation: s_det = det(J).clamp(0.6, 1.8)
     let det_j = s * s * s;
-    let expected_alpha = 1.0 - (1.0f32 - rest_opacity).powf(1.0 / det_j);
+    let s_det = det_j.clamp(0.6, 1.8);
+    let safe_base = (1.0f32 - rest_opacity).clamp(1e-4, 0.999);
+    let expected_alpha = (1.0 - safe_base.powf(1.0 / s_det)).clamp(0.05, 0.99);
     assert!(
         (output.scene.opacities[0] - expected_alpha).abs() < 1e-4,
         "Opacity scaling mismatch: got {}, expected {}",

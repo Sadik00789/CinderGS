@@ -55,16 +55,12 @@ fn generate_procedural_synthetic_cluster() -> (GaussianSceneSoa, TetMesh, Vec<ci
         scene.push(pos.to_array(), cov, opacity, &sh);
     }
 
-    // AABB Padding: center +- 0.55 * extent
-    let center = (min_pos + max_pos) * 0.5;
-    let extent = (max_pos - min_pos).max(Vec3::splat(0.05));
-    let min_prime = center - 0.55 * extent;
-    let max_prime = center + 0.55 * extent;
+    let hero_min = Vec3::new(-0.7, -0.6, -0.7);
+    let hero_max = Vec3::new(0.7, 0.8, 0.7);
+    let cage = TetMesh::create_box_cage(hero_min.to_array(), hero_max.to_array());
+    let bindings = cage.bind_gaussians_with_bounds(&positions, hero_min.to_array(), hero_max.to_array());
 
-    let cage = TetMesh::create_box_cage(min_prime.to_array(), max_prime.to_array());
-    let bindings = cage.bind_gaussians(&positions);
-
-    (scene, cage, bindings, center, extent.length())
+    (scene, cage, bindings, Vec3::ZERO, 2.5)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -101,24 +97,38 @@ fn main() -> anyhow::Result<()> {
                 max_pos = Vec3::splat(0.5);
             }
 
-            // Padded AABB calculation
-            let center = (min_pos + max_pos) * 0.5;
-            let raw_extent = max_pos - min_pos;
-            let extent = raw_extent.max(Vec3::splat(0.05));
-            let min_prime = center - 0.55 * extent;
-            let max_prime = center + 0.55 * extent;
+            let hero_center = if loaded_scene.len() > 500_000 {
+                Vec3::new(0.16, 1.49, 2.25)
+            } else if loaded_scene.count > 0 {
+                (min_pos + max_pos) * 0.5
+            } else {
+                Vec3::ZERO
+            };
 
-            println!("Scene Center: {:?}, Extent: {:?}", center, extent);
-            println!("Constructing 5-tetrahedron cage with padded bounds [min', max']...");
-            let tet_cage = TetMesh::create_box_cage(min_prime.to_array(), max_prime.to_array());
+            // Define hero bounds focused strictly on the central model
+            let hero_min = hero_center + Vec3::new(-0.7, -0.6, -0.7);
+            let hero_max = hero_center + Vec3::new(0.7, 0.8, 0.7);
+            println!("Hero Center: {:?}, Hero Bounds: [{:?}, {:?}]", hero_center, hero_min, hero_max);
+            println!("Constructing 5-tetrahedron localized hero cage...");
+            let tet_cage = TetMesh::create_box_cage(hero_min.to_array(), hero_max.to_array());
 
-            println!("Binding {} Gaussians using Rayon multi-threading...", loaded_scene.len());
+            println!("Binding {} Gaussians (hero localized with u32::MAX sentinel)...", loaded_scene.len());
             let bind_timer = std::time::Instant::now();
-            let tet_bindings = tet_cage.bind_flat_positions(&loaded_scene.positions);
+            let tet_bindings = tet_cage.bind_flat_positions_with_bounds(
+                &loaded_scene.positions,
+                hero_min.to_array(),
+                hero_max.to_array(),
+            );
             let bind_elapsed = bind_timer.elapsed();
-            println!("Bound all Gaussians in {:.2} ms", bind_elapsed.as_secs_f64() * 1000.0);
+            let bound_count = tet_bindings.iter().filter(|b| b.is_bound()).count();
+            println!(
+                "Bound {} / {} Gaussians to hero cage in {:.2} ms (unbound splats remain static and opaque)",
+                bound_count,
+                loaded_scene.len(),
+                bind_elapsed.as_secs_f64() * 1000.0
+            );
 
-            (loaded_scene, tet_cage, tet_bindings, center, extent.length().max(1.0))
+            (loaded_scene, tet_cage, tet_bindings, hero_center, 3.2f32)
         }
     } else {
         println!("No PLY file specified. Generating procedural synthetic cluster (2,000 Gaussians in unit cage)...");
@@ -127,7 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = EventLoop::new()?;
     let mut app = CinderApp::new(scene, Some(cage), Some(bindings));
-    app.camera = OrbitCamera::new(cam_target, cam_dist * 1.8);
+    app.camera = OrbitCamera::new(cam_target, cam_dist);
 
     println!("Starting CinderGS engine window...");
     event_loop.run_app(&mut app)?;

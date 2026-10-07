@@ -241,6 +241,9 @@ fn main() {
     let bind_weights_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
         bytemuck::cast_slice(&bind_weights).to_vec(),
     ));
+    let rest_pos_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
+        scene.positions_bytes().to_vec(),
+    ));
     let rest_cov_h = client.create(cubecl_common::bytes::Bytes::from_bytes_vec(
         scene.covariances_bytes().to_vec(),
     ));
@@ -333,6 +336,7 @@ fn main() {
         let rot_arg = unsafe { BufferArg::from_raw_parts(rot_handle.clone(), num_tets as usize * 9) };
         let bind_t_arg = unsafe { BufferArg::from_raw_parts(bind_tets_h.clone(), bind_tets.len()) };
         let bind_w_arg = unsafe { BufferArg::from_raw_parts(bind_weights_h.clone(), bind_weights.len()) };
+        let r_pos_arg = unsafe { BufferArg::from_raw_parts(rest_pos_h.clone(), splat_count * 3) };
         let r_cov_arg = unsafe { BufferArg::from_raw_parts(rest_cov_h.clone(), splat_count * 6) };
         let r_opa_arg = unsafe { BufferArg::from_raw_parts(rest_opa_h.clone(), splat_count) };
         let sh_arg = unsafe { BufferArg::from_raw_parts(sh_h.clone(), splat_count * 48) };
@@ -350,6 +354,7 @@ fn main() {
             rot_arg,
             bind_t_arg,
             bind_w_arg,
+            r_pos_arg,
             r_cov_arg,
             r_opa_arg,
             sh_arg,
@@ -362,6 +367,7 @@ fn main() {
             camera.view_matrix[14],
             compositor.sh_degree,
             splat_count as u32,
+            num_tets,
         );
 
         // Stage 2: Projection
@@ -457,6 +463,7 @@ fn main() {
         let rot_arg = unsafe { BufferArg::from_raw_parts(rot_handle.clone(), num_tets as usize * 9) };
         let bind_t_arg = unsafe { BufferArg::from_raw_parts(bind_tets_h.clone(), bind_tets.len()) };
         let bind_w_arg = unsafe { BufferArg::from_raw_parts(bind_weights_h.clone(), bind_weights.len()) };
+        let r_pos_arg = unsafe { BufferArg::from_raw_parts(rest_pos_h.clone(), splat_count * 3) };
         let r_cov_arg = unsafe { BufferArg::from_raw_parts(rest_cov_h.clone(), splat_count * 6) };
         let r_opa_arg = unsafe { BufferArg::from_raw_parts(rest_opa_h.clone(), splat_count) };
         let sh_arg = unsafe { BufferArg::from_raw_parts(sh_h.clone(), splat_count * 48) };
@@ -474,6 +481,7 @@ fn main() {
             rot_arg,
             bind_t_arg,
             bind_w_arg,
+            r_pos_arg,
             r_cov_arg,
             r_opa_arg,
             sh_arg,
@@ -486,6 +494,7 @@ fn main() {
             camera.view_matrix[14],
             compositor.sh_degree,
             splat_count as u32,
+            num_tets,
         );
         pollster::block_on(client.sync()).expect("GPU sync failed");
         gpu_t_deform += start.elapsed().as_secs_f64();

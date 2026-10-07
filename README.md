@@ -25,10 +25,10 @@
 2. **Zero-Copy Memory-Mapped PLY Ingestion:**
    - Sequential little-endian binary header and attribute streaming via `memmap2` and `bytemuck`.
    - Ingests over **2,000,000 raw Gaussian splats in under 85 ms** (62 properties per vertex, 248 bytes/vertex).
-3. **Real-Time Volumetric Cage Kinematics:**
-   - Arbitrary mesh deformation using a bounding 5-tetrahedron lattice with barycentric coordinates $\mathbf{w}_i = (w_0, w_1, w_2, w_3)$.
+3. **Real-Time Volumetric Cage Kinematics & Hero Isolation:**
+   - Arbitrary mesh deformation using a localized 5-tetrahedron hero cage with barycentric coordinates $\mathbf{w}_i = (w_0, w_1, w_2, w_3)$ and `u32::MAX` sentinel handling that keeps background splats 100% static and opaque.
    - Affine covariance deformation: $\Sigma' = J \Sigma_{\text{rest}} J^T$ computed per splat.
-   - Energy-conserving volumetric opacity adjustment: $\alpha' = 1 - (1 - \alpha)^{1 / \det(J)}$.
+   - Energy-conserving volumetric opacity stabilization: hard-bounded volume dilation $\alpha' = 1 - (1 - \alpha)^{1 / s_{\det}}$ ($s_{\det} = \operatorname{clamp}(\det(J), 0.6, 1.8)$), preventing stretched splats from evaporating into transparency.
 4. **Inverse-Ray Spherical Harmonics Evaluation:**
    - Rotates the viewing direction into local tetrahedral reference coordinates $(\mathbf{d}_ {\text{local}} = R^T \mathbf{d}_ {\text{world}})$ using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
 5. **Cooperative Shared-Memory Tile Compositor:**

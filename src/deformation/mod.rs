@@ -36,9 +36,27 @@ pub struct GaussianBinding {
 }
 
 impl GaussianBinding {
+    /// Sentinel tetrahedron index indicating an unbound, static Gaussian (outside cage).
+    pub const UNBOUND: u32 = u32::MAX;
+
     #[inline]
     pub const fn new(tet_index: u32, weights: [f32; 4]) -> Self {
         Self { tet_index, weights }
+    }
+
+    /// Constructs an unbound binding with zero weights and `tet_index = u32::MAX`.
+    #[inline]
+    pub const fn unbound() -> Self {
+        Self {
+            tet_index: Self::UNBOUND,
+            weights: [0.0; 4],
+        }
+    }
+
+    /// Returns true if this Gaussian is bound to an active cage tetrahedron.
+    #[inline]
+    pub fn is_bound(&self) -> bool {
+        self.tet_index != Self::UNBOUND
     }
 }
 
@@ -191,6 +209,69 @@ impl TetMesh {
             .collect()
     }
 
+    /// Computes barycentric binding coordinates, restricting active deformation strictly
+    /// to Gaussians within `[hero_min, hero_max]`.
+    /// Any Gaussian outside hero bounds receives `tet_index = u32::MAX` and zero weights.
+    pub fn bind_gaussians_with_bounds(
+        &self,
+        positions: &[[f32; 3]],
+        hero_min: [f32; 3],
+        hero_max: [f32; 3],
+    ) -> Vec<GaussianBinding> {
+        positions
+            .par_iter()
+            .map(|&p_arr| {
+                if p_arr[0] < hero_min[0]
+                    || p_arr[0] > hero_max[0]
+                    || p_arr[1] < hero_min[1]
+                    || p_arr[1] > hero_max[1]
+                    || p_arr[2] < hero_min[2]
+                    || p_arr[2] > hero_max[2]
+                {
+                    return GaussianBinding::unbound();
+                }
+
+                let p = Vec3::from(p_arr);
+                let mut best_tet = GaussianBinding::UNBOUND;
+                let mut best_penalty = f32::INFINITY;
+                let mut best_weights = [0.0f32; 4];
+
+                for (t_idx, elem) in self.elements.iter().enumerate() {
+                    let x0 = Vec3::from(self.rest_vertices[elem.indices[0] as usize]);
+                    let inv_dm = self.precomputed[t_idx].matrix();
+
+                    let delta = p - x0;
+                    let w123 = inv_dm * delta;
+                    let w1 = w123.x;
+                    let w2 = w123.y;
+                    let w3 = w123.z;
+                    let w0 = 1.0 - (w1 + w2 + w3);
+
+                    let penalty = (-w0).max(0.0)
+                        + (-w1).max(0.0)
+                        + (-w2).max(0.0)
+                        + (-w3).max(0.0);
+
+                    if penalty <= 1e-4 {
+                        return GaussianBinding::new(t_idx as u32, [w0, w1, w2, w3]);
+                    }
+
+                    if penalty < best_penalty {
+                        best_penalty = penalty;
+                        best_tet = t_idx as u32;
+                        best_weights = [w0, w1, w2, w3];
+                    }
+                }
+
+                if best_penalty <= 0.15 {
+                    GaussianBinding::new(best_tet, best_weights)
+                } else {
+                    GaussianBinding::unbound()
+                }
+            })
+            .collect()
+    }
+
     /// Computes barycentric binding coordinates for flattened `[N * 3]` positions.
     pub fn bind_flat_positions(&self, positions: &[f32]) -> Vec<GaussianBinding> {
         assert_eq!(positions.len() % 3, 0);
@@ -199,6 +280,21 @@ impl TetMesh {
             .map(|i| [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]])
             .collect();
         self.bind_gaussians(&points)
+    }
+
+    /// Computes barycentric binding coordinates for flattened `[N * 3]` positions with hero bounds.
+    pub fn bind_flat_positions_with_bounds(
+        &self,
+        positions: &[f32],
+        hero_min: [f32; 3],
+        hero_max: [f32; 3],
+    ) -> Vec<GaussianBinding> {
+        assert_eq!(positions.len() % 3, 0);
+        let count = positions.len() / 3;
+        let points: Vec<[f32; 3]> = (0..count)
+            .map(|i| [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]])
+            .collect();
+        self.bind_gaussians_with_bounds(&points, hero_min, hero_max)
     }
 
     /// Creates a tetrahedral bounding box cage partitioning the axis-aligned box `[min, max]`

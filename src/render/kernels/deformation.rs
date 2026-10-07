@@ -196,6 +196,7 @@ pub fn deform_gaussians_kernel(
     tet_rotations: &[f32],
     bindings_tet: &[u32],
     bindings_weights: &[f32],
+    rest_positions: &[f32],
     rest_covariances: &[f32],
     rest_opacities: &[f32],
     sh_coeffs: &[f32],
@@ -208,14 +209,76 @@ pub fn deform_gaussians_kernel(
     cam_pos_z: f32,
     sh_degree: u32,
     num_gaussians: u32,
+    num_tets: u32,
 ) {
     let idx = ABSOLUTE_POS;
     if idx >= num_gaussians as usize {
         terminate!();
     }
 
+    // 0. Sentinel check for unbound background splats (outside cage)
+    let tet_raw = bindings_tet[idx];
+    if tet_raw >= num_tets {
+        let pos_base = idx * 3usize;
+        let px = rest_positions[pos_base];
+        let py = rest_positions[pos_base + 1usize];
+        let pz = rest_positions[pos_base + 2usize];
+
+        out_positions[pos_base] = px;
+        out_positions[pos_base + 1usize] = py;
+        out_positions[pos_base + 2usize] = pz;
+
+        let cov_base = idx * 6usize;
+        out_covariances[cov_base] = rest_covariances[cov_base];
+        out_covariances[cov_base + 1usize] = rest_covariances[cov_base + 1usize];
+        out_covariances[cov_base + 2usize] = rest_covariances[cov_base + 2usize];
+        out_covariances[cov_base + 3usize] = rest_covariances[cov_base + 3usize];
+        out_covariances[cov_base + 4usize] = rest_covariances[cov_base + 4usize];
+        out_covariances[cov_base + 5usize] = rest_covariances[cov_base + 5usize];
+
+        out_opacities[idx] = rest_opacities[idx];
+
+        // Standard world-space view direction with R = I
+        let vx = px - cam_pos_x;
+        let vy = py - cam_pos_y;
+        let vz = pz - cam_pos_z;
+        let dist_sq = vx * vx + vy * vy + vz * vz;
+        let inv_dist = 1.0f32 / f32::max(1e-4f32, f32::sqrt(dist_sq));
+        let dl_x = vx * inv_dist;
+        let dl_y = vy * inv_dist;
+        let dl_z = vz * inv_dist;
+
+        let sh_base = idx * 48usize;
+        let mut color_r = 0.2820948f32 * sh_coeffs[sh_base];
+        let mut color_g = 0.2820948f32 * sh_coeffs[sh_base + 1usize];
+        let mut color_b = 0.2820948f32 * sh_coeffs[sh_base + 2usize];
+
+        if sh_degree >= 1u32 {
+            let y1_m1 = -0.4886025f32 * dl_y;
+            let y1_0 = 0.4886025f32 * dl_z;
+            let y1_p1 = -0.4886025f32 * dl_x;
+
+            color_r += y1_m1 * sh_coeffs[sh_base + 3usize]
+                + y1_0 * sh_coeffs[sh_base + 4usize]
+                + y1_p1 * sh_coeffs[sh_base + 5usize];
+            color_g += y1_m1 * sh_coeffs[sh_base + 18usize]
+                + y1_0 * sh_coeffs[sh_base + 19usize]
+                + y1_p1 * sh_coeffs[sh_base + 20usize];
+            color_b += y1_m1 * sh_coeffs[sh_base + 33usize]
+                + y1_0 * sh_coeffs[sh_base + 34usize]
+                + y1_p1 * sh_coeffs[sh_base + 35usize];
+        }
+
+        let col_base = idx * 3usize;
+        out_colors[col_base] = f32::clamp(color_r + 0.5f32, 0.0f32, 1.0f32);
+        out_colors[col_base + 1usize] = f32::clamp(color_g + 0.5f32, 0.0f32, 1.0f32);
+        out_colors[col_base + 2usize] = f32::clamp(color_b + 0.5f32, 0.0f32, 1.0f32);
+
+        terminate!();
+    }
+
     // 1. Barycentric binding lookup
-    let tet_idx = bindings_tet[idx] as usize;
+    let tet_idx = tet_raw as usize;
     let w_base = idx * 4usize;
     let w0 = bindings_weights[w_base];
     let w1 = bindings_weights[w_base + 1usize];
@@ -311,19 +374,19 @@ pub fn deform_gaussians_kernel(
     out_covariances[cov_base + 4usize] = 0.5f32 * (m_12 + m_21);
     out_covariances[cov_base + 5usize] = f32::max(1e-4f32, m_22);
 
-    // C. Energy-conserving opacity scaling
+    // C. Energy-conserving opacity scaling with bounded volume dilation
     let det_j = j_00 * (j_11 * j_22 - j_12 * j_21)
         - j_01 * (j_10 * j_22 - j_12 * j_20)
         + j_02 * (j_10 * j_21 - j_11 * j_20);
 
-    let s_det = f32::clamp(det_j, 0.01f32, 100.0f32);
-    let base = f32::clamp(1.0f32 - rest_opacities[idx], 1e-4f32, 1.0f32);
-    let def_alpha = f32::clamp(
-        1.0f32 - f32::powf(base, 1.0f32 / s_det),
-        0.0f32,
+    let s_det = f32::clamp(det_j, 0.6f32, 1.8f32);
+    let safe_base = f32::clamp(1.0f32 - rest_opacities[idx], 1e-4f32, 0.999f32);
+    let alpha_prime = f32::clamp(
+        1.0f32 - f32::powf(safe_base, 1.0f32 / s_det),
+        0.05f32,
         0.99f32,
     );
-    out_opacities[idx] = def_alpha;
+    out_opacities[idx] = alpha_prime;
 
     // D. Inverse-ray directional SH evaluation
     let r_base = tet_idx * 9usize;

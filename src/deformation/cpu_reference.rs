@@ -79,6 +79,42 @@ pub fn deform_scene_cpu(
         .into_par_iter()
         .map(|i| {
             let binding = &bindings[i];
+            let num_tets = tet_mesh.elements.len();
+
+            // Sentinel handling for unbound background splats: static and preserved opacity
+            if binding.tet_index == GaussianBinding::UNBOUND || binding.tet_index as usize >= num_tets {
+                let rest_pos = [
+                    scene.positions[i * 3],
+                    scene.positions[i * 3 + 1],
+                    scene.positions[i * 3 + 2],
+                ];
+                let rest_cov = [
+                    scene.covariances_3d[i * 6],
+                    scene.covariances_3d[i * 6 + 1],
+                    scene.covariances_3d[i * 6 + 2],
+                    scene.covariances_3d[i * 6 + 3],
+                    scene.covariances_3d[i * 6 + 4],
+                    scene.covariances_3d[i * 6 + 5],
+                ];
+                let rest_alpha = scene.opacities[i];
+                let to_cam = Vec3::from(rest_pos) - cam_pos;
+                let dist = to_cam.length();
+                let d_world = if dist > 1e-6 {
+                    to_cam / dist
+                } else {
+                    Vec3::Z
+                };
+                let sh_slice = &scene.sh_coeffs[i * 48..(i + 1) * 48];
+                let rgb = evaluate_sh(sh_slice, d_world, sh_degree);
+
+                return DeformedGaussianItem {
+                    pos: rest_pos,
+                    cov: rest_cov,
+                    alpha: rest_alpha,
+                    color: rgb,
+                };
+            }
+
             let t_idx = binding.tet_index as usize;
             let elem = &tet_mesh.elements[t_idx];
             let w = binding.weights;
@@ -114,12 +150,12 @@ pub fn deform_scene_cpu(
                 m.z_axis.z.max(1e-4),                         // zz
             ];
 
-            // C. Energy-conserving opacity scaling
+            // C. Energy-conserving opacity scaling with hard-bounded volume dilation
             let rest_alpha = scene.opacities[i];
             let det_j = j.determinant();
-            let s_det = det_j.clamp(0.01, 100.0);
-            let base = (1.0 - rest_alpha).clamp(1e-4, 1.0);
-            let def_alpha = (1.0 - base.powf(1.0 / s_det)).clamp(0.0, 0.99);
+            let s_det = det_j.clamp(0.6, 1.8);
+            let safe_base = (1.0 - rest_alpha).clamp(1e-4, 0.999);
+            let def_alpha = (1.0 - safe_base.powf(1.0 / s_det)).clamp(0.05, 0.99);
 
             // D. Inverse-ray directional SH evaluation
             let to_cam = def_pos - cam_pos;

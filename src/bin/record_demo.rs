@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
 
     let width = 960u32;
     let height = 540u32;
-    const TOTAL_FRAMES: usize = 120;
+    const TOTAL_FRAMES: usize = 180;
     const FPS: u32 = 30;
 
     let ply_path = std::env::args()
@@ -130,11 +130,13 @@ fn main() -> anyhow::Result<()> {
             t0.elapsed().as_secs_f64() * 1000.0
         );
         if loaded.len() > 500_000 {
-            // Canonical Bonsai scene: tightly enclose central bonsai tree and table
-            let center = Vec3::new(-0.8, 1.6, 3.2);
-            let c_min = Vec3::new(-2.8, -0.4, 1.2);
-            let c_max = Vec3::new(1.2, 3.6, 5.2);
-            let dist = 5.0;
+            // Canonical Bonsai scene: localized hero cage focused strictly on the central model
+            let center = Vec3::new(0.16, 1.49, 2.25);
+            let hero_offset_min = Vec3::new(-0.7, -0.6, -0.7);
+            let hero_offset_max = Vec3::new(0.7, 0.8, 0.7);
+            let c_min = center + hero_offset_min;
+            let c_max = center + hero_offset_max;
+            let dist = 3.2;
             (loaded, c_min, c_max, center, dist)
         } else {
             let (c_min, c_max, target, dist) = compute_scene_bounds(&loaded);
@@ -151,14 +153,16 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!("Scene Target: {:?}, Camera Distance: {:.2}", cam_target, cam_dist);
-    println!("Constructing 5-tet bounding cage from {:?} to {:?}", cage_min, cage_max);
+    println!("Constructing 5-tet localized hero cage from {:?} to {:?}", cage_min, cage_max);
     let cage = TetMesh::create_box_cage(cage_min.to_array(), cage_max.to_array());
 
-    println!("Binding {} Gaussians to tetrahedral cage...", scene.len());
+    println!("Binding {} Gaussians (hero localized with u32::MAX sentinel)...", scene.len());
     let t_bind = Instant::now();
-    let bindings = cage.bind_flat_positions(&scene.positions);
+    let bindings = cage.bind_flat_positions_with_bounds(&scene.positions, cage_min.to_array(), cage_max.to_array());
+    let bound_count = bindings.iter().filter(|b| b.is_bound()).count();
     println!(
-        "Bound {} Gaussians in {:.2} ms",
+        "Bound {} / {} Gaussians to hero cage in {:.2} ms (unbound splats remain static and opaque)",
+        bound_count,
         bindings.len(),
         t_bind.elapsed().as_secs_f64() * 1000.0
     );
@@ -235,7 +239,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut camera = OrbitCamera::new(cam_target, cam_dist);
-    camera.pitch = 0.25;
+    camera.pitch = 0.20;
     let initial_yaw = 0.0;
     camera.yaw = initial_yaw;
 
@@ -257,33 +261,32 @@ fn main() -> anyhow::Result<()> {
         let frame_start = Instant::now();
 
         let show_wireframe = true;
-        let selected_vertex = if frame_idx < 40 {
-            // Stage 1 (Frames 0–39): Camera 360° orbit around model with rest cage wireframe
-            let orbit_progress = frame_idx as f32 / 40.0;
-            camera.yaw = initial_yaw + orbit_progress * 2.0 * PI;
+        let selected_vertex = if frame_idx <= 45 {
+            // Stage 1 (Frames 0–45): Smooth 45° orbit around the central model with cage wireframe visible
+            let orbit_progress = frame_idx as f32 / 45.0;
+            camera.yaw = initial_yaw + orbit_progress * (PI / 4.0);
             simulator.reset();
             None
-        } else if frame_idx < 80 {
-            // Stage 2 (Frames 40–79): Interactive displacement of top cage vertex handle
-            // Delta x = [0.4 * sin(t), 0.2, 0.3 * cos(t)]
-            let t = (frame_idx - 40) as f32 / 40.0 * 2.0 * PI;
-            let ease = ((frame_idx - 40) as f32 / 8.0).min(1.0);
-            let delta_x = [
-                0.4 * t.sin() * ease,
-                0.2 * ease,
-                0.3 * t.cos() * ease,
-            ];
+        } else if frame_idx <= 90 {
+            // Stage 2 (Frames 46–90): Horizontal tree displacement along the camera-plane X axis:
+            // Δx = u * (0.20 * sin((f - 45) * π / 45))
+            camera.yaw = initial_yaw + (PI / 4.0);
+            let (cam_right, _, _) = camera.camera_axes();
+            let progress = (frame_idx - 45) as f32 / 45.0;
+            let disp = 0.20 * (progress * std::f32::consts::FRAC_PI_2).sin();
+            let delta_x = cam_right * disp;
             let new_pos = [
-                top_handle_rest[0] + delta_x[0],
-                top_handle_rest[1] + delta_x[1],
-                top_handle_rest[2] + delta_x[2],
+                top_handle_rest[0] + delta_x.x,
+                top_handle_rest[1] + delta_x.y,
+                top_handle_rest[2] + delta_x.z,
             ];
             simulator.set_pinned(Some(top_handle_idx));
             simulator.set_pinned_position(top_handle_idx, new_pos);
             Some(top_handle_idx)
         } else {
-            // Stage 3 (Frames 80–119): Vertex release triggering damped spring oscillation & settling
-            if frame_idx == 80 {
+            // Stage 3 (Frames 91–180): Pin is released. Step CageSpringSimulator::step(1.0 / 30.0) every frame so the foliage visibly oscillates and settles back to rest
+            camera.yaw = initial_yaw + (PI / 4.0);
+            if frame_idx == 91 {
                 simulator.set_pinned(None);
             }
             simulator.step(1.0 / FPS as f32);
@@ -443,8 +446,27 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Ok(metadata) = fs::metadata(&gif_output) {
-        let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+        let mut size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
         println!("GIF File Size: {:.2} MB (target < 15 MB)", size_mb);
+        if size_mb >= 15.0 {
+            println!("GIF size ({:.2} MB) exceeds 15 MB ceiling. Re-encoding with optimized palette & resolution...", size_mb);
+            let _ = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-framerate",
+                    &FPS.to_string(),
+                    "-i",
+                    output_dir.join("frame_%04d.png").to_str().unwrap(),
+                    "-vf",
+                    "fps=24,scale=800:450:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
+                    gif_output.to_str().unwrap(),
+                ])
+                .status();
+            if let Ok(meta2) = fs::metadata(&gif_output) {
+                size_mb = meta2.len() as f64 / (1024.0 * 1024.0);
+                println!("Optimized GIF File Size: {:.2} MB", size_mb);
+            }
+        }
         assert!(size_mb < 15.0, "GIF file size exceeded 15 MB!");
     }
 
