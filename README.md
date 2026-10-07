@@ -8,6 +8,11 @@
 [![CI](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml/badge.svg)](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml)
 [![Tests Passing](https://img.shields.io/badge/Tests-86%20Passed-brightgreen.svg?style=flat-square)](tests/integration_tests.rs)
 
+<div align="center">
+  <img src="docs/cindergs_demo.gif" alt="CinderGS Real-Time Deformation Demo" width="100%">
+  <p><em>Real-time 3D Gaussian Splatting with interactive volumetric cage kinematics and damped spring jiggle physics at 101.9 FPS on an RTX 3050 Laptop GPU.</em></p>
+</div>
+
 **CinderGS** is an ultra-high-performance, state-of-the-art 3D Gaussian Splatting (3DGS) rasterization and volumetric deformation engine written entirely in pure Rust. Built on top of **CubeCL** and **WGPU**, CinderGS completely eliminates legacy C++, CUDA toolkit, LibTorch, and Inria native extensions in favor of fully portable, multi-backend GPU compute kernels that run natively across Linux (Vulkan), macOS (Metal), and Windows (DirectX 12 / Vulkan).
 
 ---
@@ -266,6 +271,12 @@ cargo run --release -- path/to/capture.ply
 ```bash
 cargo run --release --bin benchmark
 ```
+
+### 5. Autonomous Headless Demo Recording
+```bash
+cargo run --release --bin record_demo
+```
+Programmatically executes the 120-frame trajectory (360° orbit, top handle deformation, and damped spring release) and encodes production media (`docs/cindergs_demo.mp4` and `docs/cindergs_demo.gif`).
 
 ---
 

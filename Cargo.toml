@@ -20,6 +20,7 @@ egui-winit = "0.28"
 egui-wgpu = "0.28"
 wgpu = "0.20"
 pollster = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 
 

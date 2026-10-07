@@ -1,5 +1,7 @@
 /target
 *.ply
+assets/*.ply
+target/demo_frames
 .DS_Store
 *.swp
 *.log

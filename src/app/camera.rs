@@ -78,18 +78,18 @@ impl OrbitCamera {
         self.target + offset
     }
 
-    /// Computes the Right-Handed World-to-Camera View Matrix.
+    /// Computes the Left-Handed World-to-Camera View Matrix (matching 3DGS projection convention).
     pub fn view_matrix(&self) -> Mat4 {
         let eye = self.eye_position();
-        Mat4::look_at_rh(eye, self.target, Vec3::Y)
+        Mat4::look_at_lh(eye, self.target, Vec3::Y)
     }
 
     /// Computes the camera world-space unit axes: (right $\mathbf{u}$, up $\mathbf{v}$, forward $\mathbf{f}$).
     pub fn camera_axes(&self) -> (Vec3, Vec3, Vec3) {
         let eye = self.eye_position();
         let forward = (self.target - eye).normalize_or_zero();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
+        let right = Vec3::Y.cross(forward).normalize_or_zero();
+        let up = forward.cross(right).normalize_or_zero();
         (right, up, forward)
     }
 
