@@ -5,9 +5,10 @@
 [![CubeCL 0.11](https://img.shields.io/badge/CubeCL-v0.11-darkgreen.svg?style=flat-square)](https://cubecl.org/)
 [![CUDA/C++ Free](https://img.shields.io/badge/C%2B%2B%2FCUDA-Zero_Dependencies-success.svg?style=flat-square)](https://github.com/Sadik00789/CinderGS)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=flat-square)](LICENSE)
+[![CI](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml/badge.svg)](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml)
 [![Tests Passing](https://img.shields.io/badge/Tests-86%20Passed-brightgreen.svg?style=flat-square)](tests/integration_tests.rs)
 
-**CinderGS** is an ultra-high-performance, state-of-the-art 3D Gaussian Splatting (3DGS) rasterization and deformation engine written entirely in pure Rust. Built on top of **CubeCL** and **WGPU**, CinderGS completely eliminates legacy C++, CUDA toolkit, LibTorch, and Inria native extensions in favor of fully portable, multi-backend GPU compute kernels that run natively across Linux (Vulkan), macOS (Metal), and Windows (DirectX 12 / Vulkan).
+**CinderGS** is an ultra-high-performance, state-of-the-art 3D Gaussian Splatting (3DGS) rasterization and volumetric deformation engine written entirely in pure Rust. Built on top of **CubeCL** and **WGPU**, CinderGS completely eliminates legacy C++, CUDA toolkit, LibTorch, and Inria native extensions in favor of fully portable, multi-backend GPU compute kernels that run natively across Linux (Vulkan), macOS (Metal), and Windows (DirectX 12 / Vulkan).
 
 ---
 
@@ -24,10 +25,10 @@
    - Affine covariance deformation: $\Sigma' = J \Sigma_{\text{rest}} J^T$ computed per splat.
    - Energy-conserving volumetric opacity adjustment: $\alpha' = 1 - (1 - \alpha)^{1 / \det(J)}$.
 4. **Inverse-Ray Spherical Harmonics Evaluation:**
-   - Rotates the viewing direction into local tetrahedral reference coordinates ($\mathbf{d}_{\text{local}} = R^T \mathbf{d}_{\text{world}}$) using Higham polar decomposition $R \in \text{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
+   - Rotates the viewing direction into local tetrahedral reference coordinates ($\mathbf{d}_{\text{local}} = R^T \mathbf{d}_{\text{world}}$) using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
 5. **Cooperative Shared-Memory Tile Compositor:**
    - Viewport partitioned into $16 \times 16$ pixel workgroups.
-   - 256-thread cooperative tile fetching into GPU shared memory with deadlock-free barrier synchronization and early ray termination ($\mathcal{T} < 1e-4$).
+   - 256-thread cooperative tile fetching into GPU shared memory with deadlock-free barrier synchronization and early ray termination ($\mathcal{T} < 10^{-4}$).
 6. **Damped Spring Cage Dynamics:**
    - Interactive Hookean spring physics with timestep clamping ($\Delta t_{\text{sim}} \le 0.033\text{ s}$) preventing numerical instability during hitching.
    - Unpinned vertices physically oscillate and settle when dragged cage handles are released, accompanied by radial jiggle impulse perturbations.
@@ -119,45 +120,108 @@
 ## Mathematical Formulations
 
 ### 1. 3D Covariance Matrix Construction
+
 From optimized raw quaternion rotation $\mathbf{q} \in \mathbb{H}$ and logarithmic scale factors $\mathbf{s} \in \mathbb{R}^3$:
-$$\hat{\mathbf{q}} = \begin{cases} (0, 0, 0, 1)^T & \text{if } \|\mathbf{q}\| < 10^{-6} \\ \frac{\mathbf{q}}{\|\mathbf{q}\|} & \text{otherwise} \end{cases}$$
-$$\mathbf{s}_{\text{clamped}} = \max(\exp(\mathbf{s}), 10^{-4})$$
-$$\Sigma = R(\hat{\mathbf{q}}) \cdot \text{diag}(\mathbf{s}_{\text{clamped}}^2) \cdot R(\hat{\mathbf{q}})^T \succ 0$$
+
+$$
+\hat{\mathbf{q}} = \begin{cases} 
+\begin{bmatrix} 0 & 0 & 0 & 1 \end{bmatrix}^T & \text{if } \|\mathbf{q}\| < 10^{-6} \\ 
+\frac{\mathbf{q}}{\|\mathbf{q}\|} & \text{otherwise} 
+\end{cases}
+$$
+
+$$
+\mathbf{s}_{\text{clamped}} = \max(\exp(\mathbf{s}), 10^{-4})
+$$
+
+$$
+\Sigma = R(\hat{\mathbf{q}}) \cdot \operatorname{diag}(\mathbf{s}_{\text{clamped}}^2) \cdot R(\hat{\mathbf{q}})^T \succ 0
+$$
 
 ### 2. EWA Perspective Projection & Conics
+
 Given world-to-camera transform $W \in \mathbb{R}^{4 \times 4}$, camera-space position $\mathbf{t} = W \cdot \mathbf{p}$, and projection Jacobian $J_{\text{proj}}$:
-$$J_{\text{proj}} = \begin{bmatrix} \frac{f_x}{t_z} & 0 & -\frac{f_x t_x}{t_z^2} \\ 0 & \frac{f_y}{t_z} & -\frac{f_y t_y}{t_z^2} \end{bmatrix}$$
-$$\Sigma_{\text{cam}} = W_{3 \times 3} \Sigma W_{3 \times 3}^T, \quad \Sigma_{2D} = J_{\text{proj}} \Sigma_{\text{cam}} J_{\text{proj}}^T + \begin{bmatrix} 0.3 & 0 \\ 0 & 0.3 \end{bmatrix}$$
-$$\det(\Sigma_{2D}) = \Sigma_{2D, 00} \Sigma_{2D, 11} - \Sigma_{2D, 01}^2$$
-$$\mathbf{c}_{\text{conic}} = \begin{bmatrix} a \\ b \\ c \end{bmatrix} = \frac{1}{\det(\Sigma_{2D})} \begin{bmatrix} \Sigma_{2D, 11} \\ -\Sigma_{2D, 01} \\ \Sigma_{2D, 00} \end{bmatrix}$$
-$$\lambda_{\max} = \frac{\Sigma_{2D, 00} + \Sigma_{2D, 11}}{2} + \sqrt{\left(\frac{\Sigma_{2D, 00} - \Sigma_{2D, 11}}{2}\right)^2 + \Sigma_{2D, 01}^2}$$
-$$r = \text{clamp}(\lceil 3.0 \sqrt{\lambda_{\max}} \rceil, 1, 1024)$$
+
+$$
+J_{\text{proj}} = \begin{bmatrix} 
+\frac{f_x}{t_z} & 0 & -\frac{f_x t_x}{t_z^2} \\ 
+0 & \frac{f_y}{t_z} & -\frac{f_y t_y}{t_z^2} 
+\end{bmatrix}
+$$
+
+$$
+\Sigma_{\text{cam}} = W_{3 \times 3} \Sigma W_{3 \times 3}^T, \quad \Sigma_{2D} = J_{\text{proj}} \Sigma_{\text{cam}} J_{\text{proj}}^T + \begin{bmatrix} 0.3 & 0 \\ 0 & 0.3 \end{bmatrix}
+$$
+
+$$
+\det(\Sigma_{2D}) = \Sigma_{2D, 00} \Sigma_{2D, 11} - \Sigma_{2D, 01}^2
+$$
+
+$$
+\mathbf{c}_{\text{conic}} = \begin{bmatrix} a \\ b \\ c \end{bmatrix} = \frac{1}{\det(\Sigma_{2D})} \begin{bmatrix} \Sigma_{2D, 11} \\ -\Sigma_{2D, 01} \\ \Sigma_{2D, 00} \end{bmatrix}
+$$
+
+$$
+\lambda_{\max} = \frac{\Sigma_{2D, 00} + \Sigma_{2D, 11}}{2} + \sqrt{\left(\frac{\Sigma_{2D, 00} - \Sigma_{2D, 11}}{2}\right)^2 + \Sigma_{2D, 01}^2}
+$$
+
+$$
+r = \operatorname{clamp}\left(\lceil 3.0 \sqrt{\lambda_{\max}} \rceil, 1, 1024\right)
+$$
 
 ### 3. Volumetric Cage Kinematics
+
 Each Gaussian $i$ is bound to tetrahedron $\text{tet} = (v_0, v_1, v_2, v_3)$ via barycentric coordinates $\mathbf{w}_i$:
-$$\mathbf{x}'_i = \sum_{k=0}^3 w_{i, k} \mathbf{x}_{v_k}, \quad D_s = [\mathbf{x}_{v_1} - \mathbf{x}_{v_0}, \; \mathbf{x}_{v_2} - \mathbf{x}_{v_0}, \; \mathbf{x}_{v_3} - \mathbf{x}_{v_0}]$$
-$$J = D_s D_m^{-1}, \quad \Sigma' = J \Sigma_{\text{rest}} J^T$$
-$$\alpha' = 1 - (1 - \alpha)^{1 / \max(\det(J), 10^{-6})}$$
+
+$$
+\mathbf{x}'_i = \sum_{k=0}^3 w_{i, k} \mathbf{x}_{v_k}, \quad D_s = \begin{bmatrix} \mathbf{x}_{v_1} - \mathbf{x}_{v_0} & \mathbf{x}_{v_2} - \mathbf{x}_{v_0} & \mathbf{x}_{v_3} - \mathbf{x}_{v_0} \end{bmatrix}
+$$
+
+$$
+J = D_s D_m^{-1}, \quad \Sigma' = J \Sigma_{\text{rest}} J^T
+$$
+
+$$
+\alpha' = 1 - (1 - \alpha)^{1 / \max(\det(J), 10^{-6})}
+$$
 
 ### 4. Higham Polar Decomposition for SH Rotation
-To rotate viewing direction without mutating 48 SH spherical harmonics coefficients, $J$ is decomposed into $J = R P$ where $R \in \text{SO}(3)$ using scaled Newton-Schulz iterations:
-$$R_0 = J, \quad R_{k+1} = \frac{1}{2} \left( \gamma_k R_k + \frac{1}{\gamma_k} R_k^{-T} \right)$$
-Enforcing proper chirality $\det(R) = +1$:
-$$\mathbf{d}_{\text{local}} = R^T \left( \frac{\mathbf{p}' - \mathbf{c}_{\text{cam}}}{\|\mathbf{p}' - \mathbf{c}_{\text{cam}}\|} \right)$$
+
+To rotate viewing direction without mutating 48 SH spherical harmonics coefficients, the deformation Jacobian $J$ is decomposed into $J = R P$ where $R \in \mathrm{SO}(3)$ using scaled Newton-Schulz iterations:
+
+$$
+R_0 = J, \quad R_{k+1} = \frac{1}{2} \left( \gamma_k R_k + \frac{1}{\gamma_k} R_k^{-T} \right)
+$$
+
+Enforcing proper chirality $\det(R) = +1$, the view direction is evaluated in local reference coordinates:
+
+$$
+\mathbf{d}_{\text{local}} = R^T \left( \frac{\mathbf{p}' - \mathbf{c}_{\text{cam}}}{\|\mathbf{p}' - \mathbf{c}_{\text{cam}}\|} \right)
+$$
 
 ### 5. Damped Spring Cage Dynamics
+
 Cage elasticity update per unpinned vertex $k$:
-$$\Delta t_{\text{sim}} = \min(\Delta t, 0.033)$$
-$$\mathbf{a}_k = \frac{k_{\text{stiffness}}}{m} (\mathbf{X}_{\text{rest}, k} - \mathbf{x}_k)$$
-$$\mathbf{v}_k^{t+1} = \gamma \cdot (\mathbf{v}_k^t + \mathbf{a}_k \Delta t_{\text{sim}})$$
-$$\mathbf{x}_k^{t+1} = \mathbf{x}_k^t + \mathbf{v}_k^{t+1} \Delta t_{\text{sim}}$$
-*(Baseline: $k_{\text{stiffness}} = 180.0\text{ N/m}$, $\gamma = 0.92$, $m = 1.0\text{ kg}$)*
+
+$$
+\Delta t_{\text{sim}} = \min(\Delta t, 0.033)
+$$
+
+$$
+\begin{aligned}
+\mathbf{a}_k &= \frac{k_{\text{stiffness}}}{m} (\mathbf{X}_{\text{rest}, k} - \mathbf{x}_k) \\
+\mathbf{v}_k^{t+1} &= \gamma \cdot (\mathbf{v}_k^t + \mathbf{a}_k \Delta t_{\text{sim}}) \\
+\mathbf{x}_k^{t+1} &= \mathbf{x}_k^t + \mathbf{v}_k^{t+1} \Delta t_{\text{sim}}
+\end{aligned}
+$$
+
+*(Baseline parameters: $k_{\text{stiffness}} = 180.0\text{ N/m}$, $\gamma = 0.92$, $m = 1.0\text{ kg}$)*
 
 ---
 
 ## Benchmark Latency Table
 
-*Evaluated on synthetic and real scenes (1,500,000 active splats at $1920 \times 1080$ resolution).*
+*Evaluated on synthetic and real scenes (1,500,000 active splats at 1920 × 1080 resolution).*
 
 | Stage | NVIDIA RTX 4090 | NVIDIA RTX 3080 | AMD RX 7900 XTX | Apple M3 Max |
 | :--- | :---: | :---: | :---: | :---: |
