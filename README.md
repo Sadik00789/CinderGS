@@ -135,7 +135,7 @@ $$
 $$
 
 $$
-\Sigma = R(\hat{\mathbf{q}}) \cdot \operatorname{diag}(\mathbf{s}_{\text{clamped}}^2) \cdot R(\hat{\mathbf{q}})^T \succ 0
+\Sigma = R(\hat{\mathbf{q}}) \cdot \mathrm{diag}(\mathbf{s}_{\text{clamped}}^2) \cdot R(\hat{\mathbf{q}})^T \succ 0
 $$
 
 ### 2. EWA Perspective Projection & Conics
@@ -166,7 +166,7 @@ $$
 $$
 
 $$
-r = \operatorname{clamp}\left(\lceil 3.0 \sqrt{\lambda_{\max}} \rceil, 1, 1024\right)
+r = \mathrm{clamp}\left(\lceil 3.0 \sqrt{\lambda_{\max}} \rceil, 1, 1024\right)
 $$
 
 ### 3. Volumetric Cage Kinematics
@@ -215,23 +215,23 @@ $$
 \end{aligned}
 $$
 
-*(Baseline parameters: $k_{\text{stiffness}} = 180.0\text{ N/m}$, $\gamma = 0.92$, $m = 1.0\text{ kg}$)*
+Baseline parameters: Stiffness $k = 180.0\text{ N/m}$, damping $\gamma = 0.92$, mass $m = 1.0\text{ kg}$.
 
 ---
 
 ## Benchmark Latency Table
 
-*Evaluated on synthetic and real scenes (1,500,000 active splats at 1920 × 1080 resolution).*
+*Empirically measured on hardware: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM) at 1920 × 1080 resolution.*
 
-| Stage | NVIDIA RTX 4090 | NVIDIA RTX 3080 | AMD RX 7900 XTX | Apple M3 Max |
-| :--- | :---: | :---: | :---: | :---: |
-| **Stage 1: Cage Deformation** | 0.42 ms | 0.81 ms | 0.74 ms | 1.15 ms |
-| **Stage 2: EWA 3D-to-2D Projection** | 0.65 ms | 1.28 ms | 1.12 ms | 1.68 ms |
-| **Stage 3: Tile Binning & Radix Sort** | 1.15 ms | 2.10 ms | 1.95 ms | 2.80 ms |
-| **Stage 4: Shared-Memory Compositor** | 1.85 ms | 3.65 ms | 3.20 ms | 4.35 ms |
-| **Stage 5: Fullscreen Blit & Overlays**| 0.12 ms | 0.22 ms | 0.18 ms | 0.32 ms |
-| **Total Frame Latency** | **4.19 ms** | **8.06 ms** | **7.19 ms** | **10.30 ms** |
-| **Effective Framerate** | **238.6 FPS** | **124.0 FPS** | **139.0 FPS** | **97.0 FPS** |
+| Stage | NVIDIA GeForce RTX 3050 |
+| :--- | :---: |
+| **Stage 1: Cage Deformation** | 1.25 ms |
+| **Stage 2: EWA 3D-to-2D Projection** | 1.82 ms |
+| **Stage 3: Tile Binning & Sort** | 2.95 ms |
+| **Stage 4: Shared-Memory Compositor** | 206.30 ms |
+| **Stage 5: Fullscreen Blit & Overlays** | 0.25 ms |
+| **Total Frame Latency** | **212.57 ms** |
+| **Effective Framerate** | **4.7 FPS** |
 
 ---
 
@@ -260,6 +260,11 @@ cargo run --release
 cargo run --release -- path/to/capture.ply
 ```
 
+### 4. Run Benchmark Suite
+```bash
+cargo run --release --bin benchmark
+```
+
 ---
 
 ## Viewport Controls & HUD Guide
@@ -275,7 +280,7 @@ cargo run --release -- path/to/capture.ply
 ### Immediate-Mode HUD Controls (egui)
 - **Execution Backend:** Switch between `CPU Reference` (deterministic validation) and `CubeCL GPU` (hardware compute dispatch).
 - **Show Cage Wireframe:** Toggle translucent cyan tetrahedral edges and glowing gold vertex pick handles.
-- **Spring Stiffness ($10 - 500\text{ N/m}$):** Adjust cage elasticity restorative force.
-- **Spring Damping ($0.50 - 0.99$):** Control oscillation settling rate.
+- **Spring Stiffness (10 – 500 N/m):** Adjust cage elasticity restorative force.
+- **Spring Damping (0.50 – 0.99):** Control oscillation settling rate.
 - **Trigger Jiggle Impulse:** Perturb all unpinned cage vertices radially outward with an explosive velocity pulse.
 - **Reset Cage / Reset Camera:** Restore rest lattice topology or orbit view.
