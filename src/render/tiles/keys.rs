@@ -151,8 +151,14 @@ mod tests {
 
         assert_eq!(key_a.depth(), 1.5);
         assert_eq!(key_b.depth(), 2.5);
-        assert!(key_a < key_b, "Smaller depth must sort before larger depth within same tile");
-        assert!(key_b < key_c, "Smaller tile_id must sort before larger tile_id");
+        assert!(
+            key_a < key_b,
+            "Smaller depth must sort before larger depth within same tile"
+        );
+        assert!(
+            key_b < key_c,
+            "Smaller tile_id must sort before larger tile_id"
+        );
 
         let packed = key_a.as_u64();
         let unpacked = SortKey::from_u64(packed);

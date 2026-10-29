@@ -113,11 +113,7 @@ pub fn compute_gaussian_tile_bounds(
     let max_y = center_y + radius;
 
     // Viewport culling
-    if max_x < 0.0
-        || min_x >= screen_width as f32
-        || max_y < 0.0
-        || min_y >= screen_height as f32
-    {
+    if max_x < 0.0 || min_x >= screen_width as f32 || max_y < 0.0 || min_y >= screen_height as f32 {
         return None;
     }
 
@@ -155,9 +151,7 @@ pub fn count_tiles_touched(
         screen_width,
         screen_height,
     ) {
-        Some((tx_min, tx_max, ty_min, ty_max)) => {
-            (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
-        }
+        Some((tx_min, tx_max, ty_min, ty_max)) => (tx_max - tx_min + 1) * (ty_max - ty_min + 1),
         None => 0,
     }
 }

@@ -1,8 +1,8 @@
 use super::{
-    compute_gaussian_tile_bounds, count_tiles_touched, SortEntry, SortKey, TileConfigUniforms,
-    TileRange,
+    SortEntry, SortKey, TileConfigUniforms, TileRange, compute_gaussian_tile_bounds,
+    count_tiles_touched,
 };
-use rayon::prelude::*;
+use crate::parallel;
 
 /// Output of the tile binning, key generation, and sorting pipeline.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,38 +73,25 @@ pub fn compute_tiles_per_gaussian(
         return Vec::new();
     }
 
-    let mut tiles_per_gaussian = vec![0u32; count];
+    parallel::map_range(count, |i| {
+        let r = radii[i];
+        if r <= 0 {
+            return 0;
+        }
 
-    const CHUNK_SIZE: usize = 2048;
-    tiles_per_gaussian
-        .par_chunks_mut(CHUNK_SIZE)
-        .enumerate()
-        .for_each(|(chunk_idx, chunk)| {
-            let base_i = chunk_idx * CHUNK_SIZE;
-            for (local_i, count_out) in chunk.iter_mut().enumerate() {
-                let i = base_i + local_i;
-                let r = radii[i];
-                if r <= 0 {
-                    *count_out = 0;
-                    continue;
-                }
+        let px = points_xy[i * 2];
+        let py = points_xy[i * 2 + 1];
 
-                let px = points_xy[i * 2];
-                let py = points_xy[i * 2 + 1];
-
-                *count_out = count_tiles_touched(
-                    px,
-                    py,
-                    r as f32,
-                    config.tiles_x,
-                    config.tiles_y,
-                    config.screen_width,
-                    config.screen_height,
-                );
-            }
-        });
-
-    tiles_per_gaussian
+        count_tiles_touched(
+            px,
+            py,
+            r as f32,
+            config.tiles_x,
+            config.tiles_y,
+            config.screen_width,
+            config.screen_height,
+        )
+    })
 }
 
 /// Pass 2: Computes exclusive prefix sums of touched tile counts to determine write offsets.
@@ -127,7 +114,30 @@ pub fn prefix_sum_offsets(tiles_per_gaussian: &[u32]) -> (Vec<u32>, usize) {
     (offsets, running_sum as usize)
 }
 
-/// Pass 3: Scatters sort entries `(SortKey, gaussian_id)` into contiguous buffer using offsets.
+/// Recomputes the tiles touched by Gaussian `gaussian`, in row-major order.
+#[inline]
+fn tiles_for_gaussian(
+    gaussian: usize,
+    points_xy: &[f32],
+    radii: &[i32],
+    config: &TileConfigUniforms,
+) -> Option<(u32, u32, u32, u32)> {
+    compute_gaussian_tile_bounds(
+        points_xy[gaussian * 2],
+        points_xy[gaussian * 2 + 1],
+        radii[gaussian].max(0) as f32,
+        config.tiles_x,
+        config.tiles_y,
+        config.screen_width,
+        config.screen_height,
+    )
+}
+
+/// Pass 3: Scatters sort entries `(SortKey, gaussian_id)` into contiguous slots.
+///
+/// Each output slot is disjoint, so the scatter is expressed as a chunked fill of
+/// the output buffer instead of raw-pointer writes from a Rayon closure. Every
+/// slot's owner is recovered from the exclusive prefix sums with a binary search.
 pub fn scatter_sort_entries(
     points_xy: &[f32],
     depths: &[f32],
@@ -141,122 +151,97 @@ pub fn scatter_sort_entries(
         return Vec::new();
     }
 
-    let entries = vec![SortEntry::default(); total_entries];
-
-    // Parallel scatter over chunks of Gaussians
-    const CHUNK_SIZE: usize = 1024;
-    let n = radii.len();
-    let num_chunks = n.div_ceil(CHUNK_SIZE);
-
-    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
-        let start_i = chunk_idx * CHUNK_SIZE;
-        let end_i = (start_i + CHUNK_SIZE).min(n);
-
-        for i in start_i..end_i {
-            let count = tiles_per_gaussian[i];
-            if count == 0 {
-                continue;
-            }
-
-            let r = radii[i];
-            if r <= 0 {
-                continue;
-            }
-
-            let px = points_xy[i * 2];
-            let py = points_xy[i * 2 + 1];
-
-            if let Some((tx_min, tx_max, ty_min, ty_max)) = compute_gaussian_tile_bounds(
-                px,
-                py,
-                r as f32,
-                config.tiles_x,
-                config.tiles_y,
-                config.screen_width,
-                config.screen_height,
-            ) {
-                let depth = depths[i];
-                let depth_bits = depth.to_bits();
-                let mut curr_offset = offsets[i] as usize;
-
-                for ty in ty_min..=ty_max {
-                    for tx in tx_min..=tx_max {
-                        let tile_id = ty * config.tiles_x + tx;
-                        // Safe: write locations are disjoint per Gaussian
-                        unsafe {
-                            let ptr = entries.as_ptr() as *mut SortEntry;
-                            *ptr.add(curr_offset) = SortEntry {
-                                key: SortKey {
-                                    tile_id,
-                                    depth_bits,
-                                },
-                                gaussian_id: i as u32,
-                            };
-                        }
-                        curr_offset += 1;
-                    }
-                }
-            }
-        }
-    });
-
+    let mut entries = vec![SortEntry::default(); total_entries];
+    scatter_into(
+        &mut entries,
+        points_xy,
+        depths,
+        radii,
+        offsets,
+        tiles_per_gaussian,
+        config,
+    );
     entries
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_into(
+    entries: &mut [SortEntry],
+    points_xy: &[f32],
+    depths: &[f32],
+    radii: &[i32],
+    offsets: &[u32],
+    tiles_per_gaussian: &[u32],
+    config: &TileConfigUniforms,
+) {
+    let gaussians = offsets.len();
+    if gaussians == 0 {
+        return;
+    }
+
+    // Every output slot is written exactly once by the closure that owns it.
+    parallel::fill_range(entries, |entry_index| {
+        // Locate the Gaussian whose [offset, offset + count) range owns this slot.
+        let owner = offsets.partition_point(|&offset| offset as usize <= entry_index);
+        if owner == 0 {
+            return SortEntry::default();
+        }
+        let gaussian = owner - 1;
+        if tiles_per_gaussian[gaussian] == 0 {
+            return SortEntry::default();
+        }
+
+        let Some((tx_min, tx_max, ty_min, ty_max)) =
+            tiles_for_gaussian(gaussian, points_xy, radii, config)
+        else {
+            return SortEntry::default();
+        };
+
+        let ordinal = (entry_index - offsets[gaussian] as usize) as u32;
+        let width = tx_max.saturating_sub(tx_min) + 1;
+
+        // Row-major order matches the scatter loops used by the CPU reference.
+        let ty = ty_min + ordinal / width;
+        let tx = tx_min + ordinal % width;
+        if ty > ty_max || tx > tx_max {
+            return SortEntry::default();
+        }
+
+        SortEntry::new(
+            SortKey {
+                tile_id: ty * config.tiles_x + tx,
+                depth_bits: depths[gaussian].to_bits(),
+            },
+            gaussian as u32,
+        )
+    });
 }
 
 /// Pass 4a: Sorts `SortEntry` buffer lexicographically by `(tile_id, depth_bits)`.
 pub fn sort_entries(entries: &mut [SortEntry]) {
-    entries.par_sort_unstable();
+    parallel::sort_unstable(entries);
 }
 
-/// Pass 4b: Scans sorted entries to extract start and end boundary indices for each tile.
+/// Pass 4b: Extracts start and end boundary indices for each tile.
+///
+/// The sorted buffer is monotonic in `tile_id`, so each boundary is a pair of
+/// binary searches. This is branch-free with respect to tile occupancy and has no
+/// cross-thread writes.
 pub fn identify_tile_ranges(sorted_entries: &[SortEntry], total_tiles: u32) -> Vec<TileRange> {
-    let mut ranges = vec![TileRange::EMPTY; total_tiles as usize];
-    let total_entries = sorted_entries.len();
-
-    if total_entries == 0 {
-        return ranges;
+    if total_tiles == 0 {
+        return Vec::new();
     }
 
-    // Set first entry start
-    let first_tile = sorted_entries[0].key.tile_id as usize;
-    if first_tile < total_tiles as usize {
-        ranges[first_tile].start = 0;
-    }
-
-    // Set last entry end
-    let last_tile = sorted_entries[total_entries - 1].key.tile_id as usize;
-    if last_tile < total_tiles as usize {
-        ranges[last_tile].end = total_entries as u32;
-    }
-
-    // Parallel boundary transition detection
-    const CHUNK_SIZE: usize = 4096;
-    let num_chunks = (total_entries - 1).div_ceil(CHUNK_SIZE);
-
-    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
-        let start_k = chunk_idx * CHUNK_SIZE;
-        let end_k = (start_k + CHUNK_SIZE).min(total_entries - 1);
-
-        for k in start_k..end_k {
-            let curr_tile = sorted_entries[k].key.tile_id as usize;
-            let next_tile = sorted_entries[k + 1].key.tile_id as usize;
-
-            if curr_tile != next_tile {
-                let boundary_index = (k + 1) as u32;
-                unsafe {
-                    let ptr = ranges.as_ptr() as *mut TileRange;
-                    if curr_tile < total_tiles as usize {
-                        (*ptr.add(curr_tile)).end = boundary_index;
-                    }
-                    if next_tile < total_tiles as usize {
-                        (*ptr.add(next_tile)).start = boundary_index;
-                    }
-                }
-            }
+    parallel::map_range(total_tiles as usize, |tile_id| {
+        let tile_id = tile_id as u32;
+        let start = sorted_entries.partition_point(|entry| entry.key.tile_id < tile_id);
+        let end = sorted_entries.partition_point(|entry| entry.key.tile_id <= tile_id);
+        if start < end {
+            TileRange::new(start as u32, end as u32)
+        } else {
+            TileRange::EMPTY
         }
-    });
-
-    ranges
+    })
 }
 
 /// Complete CPU reference pipeline executing all four passes.
@@ -404,5 +389,55 @@ mod tests {
         // Tile ranges
         assert_eq!(out.tile_ranges[0], TileRange::new(0, 2));
         assert_eq!(out.tile_ranges[1], TileRange::new(2, 3));
+    }
+
+    #[test]
+    fn test_scatter_matches_direct_gaussian_enumeration() {
+        let config = TileConfigUniforms::new(800, 600, 5);
+        let points = [
+            8.0f32, 8.0, 40.0, 32.0, 100.0, 100.0, 8.0, 40.0, 300.0, 200.0,
+        ];
+        let depths = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let radii = [30, 20, 10, 0, 60];
+
+        let out = bin_and_sort_gaussians_cpu(&points, &depths, &radii, config);
+        assert!(out.total_entries > 0);
+
+        // Every entry must reference a live gaussian and belong to the tile it claims.
+        for entry in &out.sorted_entries {
+            let g = entry.gaussian_id as usize;
+            assert!(radii[g] > 0);
+            assert_eq!(entry.key.depth(), depths[g]);
+            assert!(entry.key.tile_id < config.total_tiles);
+        }
+
+        // Every slot is filled exactly once: the number of entries per tile sums to
+        // the total, and each tile range is contiguous and consistent.
+        let mut total = 0u32;
+        for (tile_id, range) in out.tile_ranges.iter().enumerate() {
+            if range.is_empty() {
+                continue;
+            }
+            total += range.end - range.start;
+            for index in range.start..range.end {
+                assert_eq!(
+                    out.sorted_entries[index as usize].key.tile_id,
+                    tile_id as u32
+                );
+            }
+        }
+        assert_eq!(total as usize, out.total_entries);
+    }
+
+    #[test]
+    fn test_identify_tile_ranges_is_total() {
+        let config = TileConfigUniforms::new(64, 64, 4);
+        let points = [8.0f32, 8.0, 20.0, 20.0, 50.0, 50.0, 8.0, 50.0];
+        let depths = [1.0f32, 2.0, 3.0, 4.0];
+        let radii = [4, 4, 4, 4];
+
+        let out = bin_and_sort_gaussians_cpu(&points, &depths, &radii, config);
+        let ranges = identify_tile_ranges(&out.sorted_entries, config.total_tiles);
+        assert_eq!(ranges, out.tile_ranges);
     }
 }
