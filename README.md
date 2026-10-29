@@ -294,7 +294,6 @@ CinderGS/
 ├── benches/
 │   └── stages.rs           # Criterion microbenchmarks for CPU stages
 ├── docs/
-│   ├── README.md           # Demo artifact guide and regeneration steps
 │   ├── cindergs_demo.gif   # Visual demonstration artifact
 │   └── cindergs_demo.mp4   # Encoded MP4 demonstration
 ├── src/
