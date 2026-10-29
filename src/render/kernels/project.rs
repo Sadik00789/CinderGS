@@ -180,11 +180,7 @@ pub fn project_gaussians_kernel(
     let min_y = mu_y - radius;
     let max_y = mu_y + radius;
 
-    if max_x < 0.0
-        || min_x >= viewport_width
-        || max_y < 0.0
-        || min_y >= viewport_height
-    {
+    if max_x < 0.0 || min_x >= viewport_width || max_y < 0.0 || min_y >= viewport_height {
         points_xy[pt_base] = mu_x;
         points_xy[pt_base + 1] = mu_y;
         depths[idx] = tz;

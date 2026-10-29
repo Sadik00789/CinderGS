@@ -1,9 +1,12 @@
+#![allow(clippy::excessive_precision)]
+
 use cubecl::prelude::*;
 
 /// Cooperative shared-memory tile compositor compute kernel.
 ///
 /// Dispatched with `CubeDim::new_1d(256)` where each workgroup (cube) corresponds
-/// to one 16x16 pixel tile `(CUBE_POS_X, CUBE_POS_Y)`.
+/// to one 16x16 pixel tile `(CUBE_POS_X, CUBE_POS_Y)`. The SH evaluation mirrors
+/// [`crate::render::rasterizer::sh::evaluate_sh`] for degrees 0 through 3.
 #[allow(clippy::unnecessary_cast, clippy::manual_div_ceil)]
 #[cube(launch)]
 pub fn tile_compositor_kernel(
@@ -90,7 +93,7 @@ pub fn tile_compositor_kernel(
             shared_conic_c[local_id as usize] = conics[g * 3usize + 2usize];
             shared_opacity[local_id as usize] = opacities[g];
 
-            // Evaluate SH color
+            // Evaluate SH colour along the world-space view direction.
             let pos_x = positions_3d[g * 3usize];
             let pos_y = positions_3d[g * 3usize + 1usize];
             let pos_z = positions_3d[g * 3usize + 2usize];
@@ -104,28 +107,93 @@ pub fn tile_compositor_kernel(
             let dir_y = vy * inv_len;
             let dir_z = vz * inv_len;
 
-            // DC term
-            let r_dc = sh_coeffs[g * 48usize];
-            let g_dc = sh_coeffs[g * 48usize + 1usize];
-            let b_dc = sh_coeffs[g * 48usize + 2usize];
-            let mut color_r = 0.2820948f32 * r_dc;
-            let mut color_g = 0.2820948f32 * g_dc;
-            let mut color_b = 0.2820948f32 * b_dc;
+            let sh_base = g * 48usize;
 
+            // Degree 0 (DC term)
+            let mut color_r = 0.282094791f32 * sh_coeffs[sh_base];
+            let mut color_g = 0.282094791f32 * sh_coeffs[sh_base + 1usize];
+            let mut color_b = 0.282094791f32 * sh_coeffs[sh_base + 2usize];
+
+            // Degree 1 (3 basis functions)
             if sh_degree >= 1u32 {
-                let y1_m1 = -0.4886025f32 * dir_y;
-                let y1_0 = 0.4886025f32 * dir_z;
-                let y1_p1 = -0.4886025f32 * dir_x;
+                let y1_m1 = -0.488602511f32 * dir_y;
+                let y1_0 = 0.488602511f32 * dir_z;
+                let y1_p1 = -0.488602511f32 * dir_x;
 
-                color_r += y1_m1 * sh_coeffs[g * 48usize + 3usize]
-                    + y1_0 * sh_coeffs[g * 48usize + 4usize]
-                    + y1_p1 * sh_coeffs[g * 48usize + 5usize];
-                color_g += y1_m1 * sh_coeffs[g * 48usize + 18usize]
-                    + y1_0 * sh_coeffs[g * 48usize + 19usize]
-                    + y1_p1 * sh_coeffs[g * 48usize + 20usize];
-                color_b += y1_m1 * sh_coeffs[g * 48usize + 33usize]
-                    + y1_0 * sh_coeffs[g * 48usize + 34usize]
-                    + y1_p1 * sh_coeffs[g * 48usize + 35usize];
+                color_r += y1_m1 * sh_coeffs[sh_base + 3usize]
+                    + y1_0 * sh_coeffs[sh_base + 4usize]
+                    + y1_p1 * sh_coeffs[sh_base + 5usize];
+                color_g += y1_m1 * sh_coeffs[sh_base + 18usize]
+                    + y1_0 * sh_coeffs[sh_base + 19usize]
+                    + y1_p1 * sh_coeffs[sh_base + 20usize];
+                color_b += y1_m1 * sh_coeffs[sh_base + 33usize]
+                    + y1_0 * sh_coeffs[sh_base + 34usize]
+                    + y1_p1 * sh_coeffs[sh_base + 35usize];
+            }
+
+            // Degree 2 (5 basis functions)
+            if sh_degree >= 2u32 {
+                let xx = dir_x * dir_x;
+                let yy = dir_y * dir_y;
+                let zz = dir_z * dir_z;
+                let xy = dir_x * dir_y;
+                let yz = dir_y * dir_z;
+                let xz = dir_x * dir_z;
+
+                let y2_m2 = 1.092548431f32 * xy;
+                let y2_m1 = -1.092548431f32 * yz;
+                let y2_0 = 0.315391565f32 * (2.0f32 * zz - xx - yy);
+                let y2_p1 = -1.092548431f32 * xz;
+                let y2_p2 = 0.546274215f32 * (xx - yy);
+
+                color_r += y2_m2 * sh_coeffs[sh_base + 6usize]
+                    + y2_m1 * sh_coeffs[sh_base + 7usize]
+                    + y2_0 * sh_coeffs[sh_base + 8usize]
+                    + y2_p1 * sh_coeffs[sh_base + 9usize]
+                    + y2_p2 * sh_coeffs[sh_base + 10usize];
+                color_g += y2_m2 * sh_coeffs[sh_base + 21usize]
+                    + y2_m1 * sh_coeffs[sh_base + 22usize]
+                    + y2_0 * sh_coeffs[sh_base + 23usize]
+                    + y2_p1 * sh_coeffs[sh_base + 24usize]
+                    + y2_p2 * sh_coeffs[sh_base + 25usize];
+                color_b += y2_m2 * sh_coeffs[sh_base + 36usize]
+                    + y2_m1 * sh_coeffs[sh_base + 37usize]
+                    + y2_0 * sh_coeffs[sh_base + 38usize]
+                    + y2_p1 * sh_coeffs[sh_base + 39usize]
+                    + y2_p2 * sh_coeffs[sh_base + 40usize];
+
+                // Degree 3 (7 basis functions)
+                if sh_degree >= 3u32 {
+                    let y3_m3 = -0.59004359f32 * dir_y * (3.0f32 * xx - yy);
+                    let y3_m2 = 2.89061144f32 * xy * dir_z;
+                    let y3_m1 = -0.457045794f32 * dir_y * (4.0f32 * zz - xx - yy);
+                    let y3_0 = 0.373176336f32 * dir_z * (2.0f32 * zz - 3.0f32 * xx - 3.0f32 * yy);
+                    let y3_p1 = -0.457045794f32 * dir_x * (4.0f32 * zz - xx - yy);
+                    let y3_p2 = 1.445305721f32 * dir_z * (xx - yy);
+                    let y3_p3 = -0.59004359f32 * dir_x * (xx - 3.0f32 * yy);
+
+                    color_r += y3_m3 * sh_coeffs[sh_base + 11usize]
+                        + y3_m2 * sh_coeffs[sh_base + 12usize]
+                        + y3_m1 * sh_coeffs[sh_base + 13usize]
+                        + y3_0 * sh_coeffs[sh_base + 14usize]
+                        + y3_p1 * sh_coeffs[sh_base + 15usize]
+                        + y3_p2 * sh_coeffs[sh_base + 16usize]
+                        + y3_p3 * sh_coeffs[sh_base + 17usize];
+                    color_g += y3_m3 * sh_coeffs[sh_base + 26usize]
+                        + y3_m2 * sh_coeffs[sh_base + 27usize]
+                        + y3_m1 * sh_coeffs[sh_base + 28usize]
+                        + y3_0 * sh_coeffs[sh_base + 29usize]
+                        + y3_p1 * sh_coeffs[sh_base + 30usize]
+                        + y3_p2 * sh_coeffs[sh_base + 31usize]
+                        + y3_p3 * sh_coeffs[sh_base + 32usize];
+                    color_b += y3_m3 * sh_coeffs[sh_base + 41usize]
+                        + y3_m2 * sh_coeffs[sh_base + 42usize]
+                        + y3_m1 * sh_coeffs[sh_base + 43usize]
+                        + y3_0 * sh_coeffs[sh_base + 44usize]
+                        + y3_p1 * sh_coeffs[sh_base + 45usize]
+                        + y3_p2 * sh_coeffs[sh_base + 46usize]
+                        + y3_p3 * sh_coeffs[sh_base + 47usize];
+                }
             }
 
             shared_rgb_r[local_id as usize] = f32::clamp(color_r + 0.5f32, 0.0f32, 1.0f32);
