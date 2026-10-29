@@ -104,7 +104,8 @@ impl OrbitCamera {
             self.yaw += 2.0 * PI;
         }
 
-        self.pitch = (self.pitch + delta_y * self.orbit_sensitivity).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
+        self.pitch =
+            (self.pitch + delta_y * self.orbit_sensitivity).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
     }
 
     /// Processes mouse panning delta $(\Delta x, \Delta y)$ along camera view plane.

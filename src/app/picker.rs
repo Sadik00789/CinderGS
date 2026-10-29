@@ -104,6 +104,80 @@ impl CagePicker {
         true
     }
 
+    /// Picks the closest cage vertex across multiple cages.
+    ///
+    /// Returns `(cage_index, vertex_index)` when a vertex is within
+    /// [`PICKING_RADIUS_PIXELS`] of `mouse_pos`.
+    pub fn pick_cage_vertex(
+        &mut self,
+        mouse_pos: [f32; 2],
+        cages: &[Vec<[f32; 3]>],
+        camera: &CameraUniforms,
+    ) -> Option<(usize, usize)> {
+        let mut closest = None;
+        let mut min_dist_sq = PICKING_RADIUS_PIXELS * PICKING_RADIUS_PIXELS;
+
+        for (cage_index, vertices) in cages.iter().enumerate() {
+            for (vertex_index, &v_arr) in vertices.iter().enumerate() {
+                let v_world = Vec3::from(v_arr);
+                let t = camera.world_to_camera(v_world);
+                if t.z <= camera.near_plane {
+                    continue;
+                }
+
+                let sx = camera.focal_x * t.x / t.z + camera.principal_x;
+                let sy = camera.focal_y * t.y / t.z + camera.principal_y;
+
+                let dx = sx - mouse_pos[0];
+                let dy = sy - mouse_pos[1];
+                let dist_sq = dx * dx + dy * dy;
+
+                if dist_sq < min_dist_sq {
+                    min_dist_sq = dist_sq;
+                    closest = Some((cage_index, vertex_index));
+                }
+            }
+        }
+
+        self.selected_vertex = closest.map(|(_, vertex)| vertex);
+        closest
+    }
+
+    /// Moves the selected vertex of the selected cage along the camera plane.
+    pub fn drag_cage_vertex(
+        &self,
+        delta: [f32; 2],
+        cages: &mut [Vec<[f32; 3]>],
+        camera: &CameraUniforms,
+        selected: (usize, usize),
+    ) -> bool {
+        let (cage_index, vertex_index) = selected;
+        let Some(vertices) = cages.get_mut(cage_index) else {
+            return false;
+        };
+        if vertex_index >= vertices.len() {
+            return false;
+        }
+
+        let cur_pos = Vec3::from(vertices[vertex_index]);
+        let t = camera.world_to_camera(cur_pos);
+        if t.z <= camera.near_plane {
+            return false;
+        }
+
+        let t_z = t.z;
+        let w = camera.view_matrix;
+        let u = Vec3::new(w[0], w[4], w[8]).normalize_or_zero();
+        let v = Vec3::new(w[1], w[5], w[9]).normalize_or_zero();
+
+        let dx_world = (delta[0] / camera.focal_x * t_z) * u;
+        let dy_world = (delta[1] / camera.focal_y * t_z) * v;
+        let new_pos = cur_pos + dx_world - dy_world;
+
+        vertices[vertex_index] = [new_pos.x, new_pos.y, new_pos.z];
+        true
+    }
+
     /// Clears any selected vertex and ends active drag.
     pub fn clear_selection(&mut self) {
         self.selected_vertex = None;

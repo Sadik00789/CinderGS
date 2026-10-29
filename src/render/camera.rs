@@ -101,6 +101,31 @@ impl CameraUniforms {
         Mat4::from_cols_array(&self.view_matrix)
     }
 
+    /// Returns the same camera rescaled to a new pixel viewport.
+    ///
+    /// The vertical field of view is preserved and the principal point is
+    /// re-centred, so resize handling cannot produce a focal/principal mismatch
+    /// between the compute kernels and the compositor.
+    pub fn with_viewport(&self, width: u32, height: u32) -> Self {
+        let width_f = width.max(1) as f32;
+        let height_f = height.max(1) as f32;
+        let old_height = self.viewport_height.max(1e-6);
+        let fov_y = 2.0 * (0.5 * old_height / self.focal_y.max(1e-6)).atan();
+        let focal = 0.5 * height_f / (0.5 * fov_y).tan();
+
+        Self {
+            view_matrix: self.view_matrix,
+            focal_x: focal,
+            focal_y: focal,
+            principal_x: 0.5 * width_f,
+            principal_y: 0.5 * height_f,
+            viewport_width: width_f,
+            viewport_height: height_f,
+            near_plane: self.near_plane,
+            _pad: 0.0,
+        }
+    }
+
     /// Returns a byte slice for GPU buffer upload.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
@@ -137,7 +162,7 @@ impl CameraUniforms {
 // Compile-time static assertions
 const _: () = {
     assert!(std::mem::size_of::<CameraUniforms>() == 96);
-    assert!(std::mem::size_of::<CameraUniforms>().is_multiple_of(16));
+    assert!((std::mem::size_of::<CameraUniforms>() % 16) == 0);
 };
 
 #[cfg(test)]
