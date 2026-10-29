@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CinderGS — PLY drop zone</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font: 15px/1.5 system-ui, sans-serif;
+        background: #0b0b0f;
+        color: #e7e7ee;
+      }
+      main {
+        width: min(680px, 92vw);
+        padding: 2rem;
+        border: 1px solid #2a2a36;
+        border-radius: 14px;
+        background: #12121a;
+      }
+      h1 { margin: 0 0 0.25rem; font-size: 1.35rem; }
+      p { color: #9a9aae; margin: 0 0 1.25rem; }
+      #drop {
+        border: 2px dashed #34344a;
+        border-radius: 12px;
+        padding: 3rem 1rem;
+        text-align: center;
+        transition: border-color 120ms ease, background 120ms ease;
+      }
+      #drop.hover { border-color: #4aa8ff; background: #161624; }
+      #status { margin-top: 1rem; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 13px; }
+      code { background: #1c1c28; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CinderGS PLY drop zone</h1>
+      <p>
+        Drop a binary 3DGS <code>.ply</code> (SH degree 0–3, little- or big-endian).
+        Parsing runs in WebAssembly; nothing is uploaded.
+      </p>
+      <div id="drop">Drop a .ply file here, or click to choose one.</div>
+      <div id="status">Waiting for a file…</div>
+      <input id="file" type="file" accept=".ply" hidden />
+    </main>
+
+    <script type="module">
+      import init, { describe_ply } from "./cinder_gs.js";
+
+      const drop = document.getElementById("drop");
+      const status = document.getElementById("status");
+      const input = document.getElementById("file");
+
+      await init();
+
+      async function inspect(file) {
+        status.textContent = `Reading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        try {
+          status.textContent = `${file.name}\n${describe_ply(bytes)}`;
+        } catch (error) {
+          status.textContent = `${file.name}\nError: ${error}`;
+        }
+      }
+
+      drop.addEventListener("click", () => input.click());
+      input.addEventListener("change", () => {
+        if (input.files?.length) inspect(input.files[0]);
+      });
+
+      for (const event of ["dragenter", "dragover"]) {
+        drop.addEventListener(event, (e) => {
+          e.preventDefault();
+          drop.classList.add("hover");
+        });
+      }
+      for (const event of ["dragleave", "drop"]) {
+        drop.addEventListener(event, (e) => {
+          e.preventDefault();
+          drop.classList.remove("hover");
+        });
+      }
+      drop.addEventListener("drop", (e) => {
+        const file = e.dataTransfer?.files?.[0];
+        if (file) inspect(file);
+      });
+    </script>
+  </body>
+</html>
