@@ -1,0 +1,15 @@
+# Normalize text files
+* text=auto
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.html text eol=lf
+
+# Large generated demo media is stored through Git LFS.
+# Existing history can be migrated with:
+#   git lfs migrate import --include="docs/*.gif,docs/*.mp4"
+*.gif filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
