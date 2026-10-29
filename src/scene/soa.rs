@@ -1,8 +1,6 @@
-use crate::math::{
-    activate_opacity, activate_rotation, activate_scale, compute_covariance_3d,
-};
+use crate::math::{activate_opacity, activate_rotation, activate_scale, compute_covariance_3d};
+use crate::parallel;
 use crate::scene::raw_vertex::RawPlyVertex;
-use rayon::prelude::*;
 use thiserror::Error;
 
 /// Error returned when `GaussianSceneSoa` buffer lengths are inconsistent with `count`.
@@ -149,13 +147,14 @@ impl GaussianSceneSoa {
 
         let chunk_size = Self::PARALLEL_CHUNK_SIZE;
 
-        positions
-            .par_chunks_mut(chunk_size * 3)
-            .zip(covariances_3d.par_chunks_mut(chunk_size * 6))
-            .zip(opacities.par_chunks_mut(chunk_size))
-            .zip(sh_coeffs.par_chunks_mut(chunk_size * 48))
-            .zip(raw.par_chunks(chunk_size))
-            .for_each(|((((pos_chunk, cov_chunk), op_chunk), sh_chunk), raw_chunk)| {
+        parallel::zip_fill_4(
+            &mut positions,
+            &mut covariances_3d,
+            &mut opacities,
+            &mut sh_coeffs,
+            [chunk_size * 3, chunk_size * 6, chunk_size, chunk_size * 48],
+            |base, pos_chunk, cov_chunk, op_chunk, sh_chunk| {
+                let raw_chunk = &raw[base..(base + op_chunk.len()).min(count)];
                 for (i, v) in raw_chunk.iter().enumerate() {
                     // 1. Position
                     let p_idx = i * 3;
@@ -176,7 +175,8 @@ impl GaussianSceneSoa {
                     sh_chunk[sh_idx..sh_idx + 3].copy_from_slice(&v.f_dc);
                     sh_chunk[sh_idx + 3..sh_idx + 48].copy_from_slice(&v.f_rest);
                 }
-            });
+            },
+        );
 
         Self {
             positions,
