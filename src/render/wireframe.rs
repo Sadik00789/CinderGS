@@ -79,13 +79,16 @@ pub fn extract_unique_edges(elements: &[TetElement]) -> Vec<[u32; 2]> {
 
 /// Builds the left-handed, zero-to-one depth projection used by the splat pipeline.
 ///
-/// The splat rasterizer is +Z-forward and left-handed; using a right-handed
-/// projection here would mirror the cage relative to the Gaussians it deforms.
+/// The splat rasterizer is +Z-forward, left-handed, and maps camera-space +Y to
+/// increasing framebuffer rows (y-down). A WGPU render pass maps NDC +Y to the
+/// top of the viewport, so the projection is flipped vertically here to keep the
+/// cage overlay aligned with the Gaussians it deforms.
 pub fn build_wireframe_view_proj(camera: &CameraUniforms) -> Mat4 {
     let aspect = camera.viewport_width / camera.viewport_height.max(1.0);
     let fov_y = (0.5 * camera.viewport_height / camera.focal_y.max(1e-6)).atan() * 2.0;
     let proj = Mat4::perspective_lh(fov_y, aspect, camera.near_plane, 1000.0);
-    proj * camera.view_mat4()
+    let y_flip = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+    y_flip * proj * camera.view_mat4()
 }
 
 /// Dedicated WGPU line-list and handle marker renderer for volumetric cages.
@@ -387,6 +390,16 @@ mod tests {
             far_ndc.z > 0.0 && far_ndc.z < 1.0,
             "forward points must land in (0, 1), got {}",
             far_ndc.z
+        );
+
+        // The splat rasterizer maps camera +Y to increasing (downward) pixel rows.
+        // The wireframe projection must flip NDC y to match: world +Y -> NDC y < 0.
+        let above = view_proj * glam::Vec4::new(0.0, 1.0, 0.0, 1.0);
+        let above_ndc = above / above.w;
+        assert!(
+            above_ndc.y < 0.0,
+            "world +Y must map to the bottom of the viewport, got ndc.y={}",
+            above_ndc.y
         );
     }
 
