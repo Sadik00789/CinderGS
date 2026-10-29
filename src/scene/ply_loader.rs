@@ -197,7 +197,7 @@ pub enum PlyError {
     InvalidPropertyType { name: String, ty: PlyScalarType },
 
     #[error(
-        "spherical harmonics layout with {count} f_rest properties is unsupported (expected 0, 3, 8, or 45)"
+        "spherical harmonics layout with {count} f_rest properties is unsupported (expected 0, 9, 24, or 45)"
     )]
     UnsupportedShLayout { count: usize },
 
@@ -442,10 +442,12 @@ pub fn parse_header(bytes: &[u8]) -> Result<PlyHeader, PlyError> {
         rest_count += 1;
     }
 
+    // Standard 3DGS exports store `(degree + 1)^2 - 1` coefficients per colour
+    // channel, so 3 channels give 0, 9, 24, or 45 `f_rest_*` properties.
     let sh_degree = match rest_count {
         0 => 0,
-        3 => 1,
-        8 => 2,
+        9 => 1,
+        24 => 2,
         45 => 3,
         count => return Err(PlyError::UnsupportedShLayout { count }),
     };
@@ -546,8 +548,8 @@ fn parse_vertex_payload(header: &PlyHeader, payload: &[u8]) -> Result<Vec<RawPly
 
     let rest_count = match header.sh_degree {
         0 => 0,
-        1 => 3,
-        2 => 8,
+        1 => 9,
+        2 => 24,
         _ => 45,
     };
 
@@ -567,9 +569,18 @@ fn parse_vertex_payload(header: &PlyHeader, payload: &[u8]) -> Result<Vec<RawPly
         for (channel, name) in ["f_dc_0", "f_dc_1", "f_dc_2"].iter().enumerate() {
             vertex.f_dc[channel] = read_property(payload, header, name, base)?;
         }
-        for rest_index in 0..rest_count {
-            let name = format!("f_rest_{rest_index}");
-            vertex.f_rest[rest_index] = read_property(payload, header, &name, base)?;
+        // PLY stores f_rest channel-major (all R, then G, then B), while the
+        // internal layout reserves 15 slots per channel. Scatter compact
+        // lower-degree exports into that stride.
+        const REST_STRIDE_PER_CHANNEL: usize = 15;
+        let rest_per_channel = rest_count / 3;
+        for channel in 0..3 {
+            for index in 0..rest_per_channel {
+                let source = channel * rest_per_channel + index;
+                let name = format!("f_rest_{source}");
+                vertex.f_rest[channel * REST_STRIDE_PER_CHANNEL + index] =
+                    read_property(payload, header, &name, base)?;
+            }
         }
 
         vertex.opacity = read_property(payload, header, "opacity", base)?;
@@ -882,7 +893,7 @@ mod tests {
 
     #[test]
     fn test_sh_degree_detection() {
-        for (rest, expected) in [(0usize, 0u32), (3, 1), (8, 2), (45, 3)] {
+        for (rest, expected) in [(0usize, 0u32), (9, 1), (24, 2), (45, 3)] {
             let mut props = standard_properties();
             let dynamic_names: Vec<String> = (0..rest).map(|i| format!("f_rest_{i}")).collect();
             for name in &dynamic_names {
@@ -892,6 +903,43 @@ mod tests {
             let header = parse_header(text.as_bytes()).expect("header parses");
             assert_eq!(header.sh_degree, expected, "rest count {rest}");
         }
+    }
+
+    #[test]
+    fn test_compact_sh_degree_one_is_scattered_per_channel() {
+        let mut props = standard_properties();
+        for i in 0..9 {
+            let name: &'static str = Box::leak(format!("f_rest_{i}").into_boxed_str());
+            props.push(("float", name));
+        }
+        let text = header_text("binary_little_endian 1.0", 1, &props);
+        let mut bytes = text.into_bytes();
+
+        let base: [f32; 14] = [
+            1.0, 2.0, 3.0, // x, y, z
+            0.1, 0.2, 0.3, // f_dc
+            0.5, // opacity
+            -1.0, 0.0, 1.0, // scale
+            1.0, 0.0, 0.0, 0.0, // rot
+        ];
+        for value in base {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in 1..=9 {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+
+        let scene = PlyLoader::load_from_bytes(&bytes).expect("degree-1 PLY must parse");
+        assert_eq!(scene.count, 1);
+
+        let sh = scene.sh_coeffs_at(0);
+        assert_eq!(&sh[..3], &[0.1, 0.2, 0.3]);
+        assert_eq!(&sh[3..6], &[1.0, 2.0, 3.0]);
+        assert_eq!(&sh[18..21], &[4.0, 5.0, 6.0]);
+        assert_eq!(&sh[33..36], &[7.0, 8.0, 9.0]);
+        assert!(sh[6..18].iter().all(|&value| value == 0.0));
+        assert!(sh[21..33].iter().all(|&value| value == 0.0));
+        assert!(sh[36..].iter().all(|&value| value == 0.0));
     }
 
     #[test]
