@@ -126,7 +126,7 @@ The resulting tensor is symmetrized and regularized with a minimum diagonal floo
 When a tetrahedron expands or compresses, the apparent volumetric density changes. CinderGS preserves visual optical thickness by scaling opacity $`\alpha`$:
 
 ```math
-\alpha' = 1 - (1 - \alpha)^{\frac{1}{\operatorname{clamp}(\det \mathbf{J},\, 0.6,\, 1.8)}}
+\alpha' = 1 - (1 - \alpha)^{\frac{1}{\mathrm{clamp}(\det \mathbf{J},\, 0.6,\, 1.8)}}
 ```
 
 #### 4. Spherical Harmonics Rotation
