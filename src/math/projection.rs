@@ -251,18 +251,16 @@ pub fn project_ewa_splat(
     };
 
     // 8. Screen-space center
-    let center = screen_space_center(
-        focal_x,
-        focal_y,
-        principal_x,
-        principal_y,
-        t.x,
-        t.y,
-        t.z,
-    );
+    let center = screen_space_center(focal_x, focal_y, principal_x, principal_y, t.x, t.y, t.z);
 
     // 9. Frustum culling
-    if is_frustum_culled(center[0], center[1], radius, viewport_width, viewport_height) {
+    if is_frustum_culled(
+        center[0],
+        center[1],
+        radius,
+        viewport_width,
+        viewport_height,
+    ) {
         return ProjectedSplat {
             point_xy: center,
             depth: t.z,
@@ -335,7 +333,16 @@ mod tests {
         // Splat behind near plane (tz = 0.1 <= 0.2)
         let pos_near = Vec3::new(0.0, 0.0, 0.1);
         let splat = project_ewa_splat(
-            pos_near, cov3d, view_matrix, 500.0, 500.0, 250.0, 250.0, 500.0, 500.0, 0.2,
+            pos_near,
+            cov3d,
+            view_matrix,
+            500.0,
+            500.0,
+            250.0,
+            250.0,
+            500.0,
+            500.0,
+            0.2,
         );
         assert!(splat.is_culled());
         assert_eq!(splat.radius, 0);
@@ -343,7 +350,16 @@ mod tests {
         // Splat exactly on near plane (tz = 0.2 <= 0.2)
         let pos_exact = Vec3::new(0.0, 0.0, 0.2);
         let splat_exact = project_ewa_splat(
-            pos_exact, cov3d, view_matrix, 500.0, 500.0, 250.0, 250.0, 500.0, 500.0, 0.2,
+            pos_exact,
+            cov3d,
+            view_matrix,
+            500.0,
+            500.0,
+            250.0,
+            250.0,
+            500.0,
+            500.0,
+            0.2,
         );
         assert!(splat_exact.is_culled());
         assert_eq!(splat_exact.radius, 0);
@@ -351,7 +367,16 @@ mod tests {
         // Splat behind camera (tz = -5.0)
         let pos_behind = Vec3::new(0.0, 0.0, -5.0);
         let splat_behind = project_ewa_splat(
-            pos_behind, cov3d, view_matrix, 500.0, 500.0, 250.0, 250.0, 500.0, 500.0, 0.2,
+            pos_behind,
+            cov3d,
+            view_matrix,
+            500.0,
+            500.0,
+            250.0,
+            250.0,
+            500.0,
+            500.0,
+            0.2,
         );
         assert!(splat_behind.is_culled());
         assert_eq!(splat_behind.radius, 0);
@@ -365,7 +390,16 @@ mod tests {
         // Center way off to the right: x = 100m, z = 2m => mu_x = 500 * 50 + 250 = 25250 >> 500
         let pos_offscreen = Vec3::new(100.0, 0.0, 2.0);
         let splat = project_ewa_splat(
-            pos_offscreen, cov3d, view_matrix, 500.0, 500.0, 250.0, 250.0, 500.0, 500.0, 0.2,
+            pos_offscreen,
+            cov3d,
+            view_matrix,
+            500.0,
+            500.0,
+            250.0,
+            250.0,
+            500.0,
+            500.0,
+            0.2,
         );
         assert!(splat.is_culled());
         assert_eq!(splat.radius, 0);
@@ -404,7 +438,11 @@ mod tests {
             assert!(a > 0.0, "Conic 'a' must be positive, got {}", a);
             assert!(c > 0.0, "Conic 'c' must be positive, got {}", c);
             let conic_det = a * c - b * b;
-            assert!(conic_det > 0.0, "Conic det must be positive, got {}", conic_det);
+            assert!(
+                conic_det > 0.0,
+                "Conic det must be positive, got {}",
+                conic_det
+            );
         }
     }
 

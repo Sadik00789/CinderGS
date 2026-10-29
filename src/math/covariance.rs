@@ -212,7 +212,10 @@ mod tests {
 
         let det_min = covariance_determinant(&cov_min);
         assert!(det_min > 0.0, "det(Sigma) must be > 0, got {}", det_min);
-        assert!(is_positive_definite(&cov_min), "Sigma must be positive definite");
+        assert!(
+            is_positive_definite(&cov_min),
+            "Sigma must be positive definite"
+        );
 
         // Analytical determinant for diagonal matrix with s_i = 1e-4:
         // det = (1e-4)^2 * (1e-4)^2 * (1e-4)^2 = (1e-4)^6 = 1e-24
@@ -229,7 +232,12 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.5, 0.5, 0.5, 0.5],
-            [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0],
+            [
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+                0.0,
+                0.0,
+            ],
             [-0.3, 0.8, -0.4, 0.2],
         ];
 
@@ -247,8 +255,19 @@ mod tests {
                 let cov = compute_covariance_3d(s, q);
 
                 let det = covariance_determinant(&cov);
-                assert!(det > 0.0, "Determinant {} must be positive for s={:?}, r={:?}", det, raw_s, raw_r);
-                assert!(is_positive_definite(&cov), "Matrix must be positive definite for s={:?}, r={:?}", raw_s, raw_r);
+                assert!(
+                    det > 0.0,
+                    "Determinant {} must be positive for s={:?}, r={:?}",
+                    det,
+                    raw_s,
+                    raw_r
+                );
+                assert!(
+                    is_positive_definite(&cov),
+                    "Matrix must be positive definite for s={:?}, r={:?}",
+                    raw_s,
+                    raw_r
+                );
 
                 // Cross-check with Glam Mat3 determinant
                 let mat = covariance_matrix_from_slice(&cov);
@@ -269,7 +288,11 @@ mod tests {
             let q = activate_rotation([1.0, 0.0, 0.0, 0.0]);
             let cov = compute_covariance_3d(s, q);
             let det = covariance_determinant(&cov);
-            assert!(det > 0.0, "det(Sigma) must be > 0 for extreme scale {:?}", raw_s);
+            assert!(
+                det > 0.0,
+                "det(Sigma) must be > 0 for extreme scale {:?}",
+                raw_s
+            );
             assert!(is_positive_definite(&cov));
         }
     }

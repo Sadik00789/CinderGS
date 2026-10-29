@@ -6,9 +6,10 @@ use glam::Vec3;
 /// - Timestep clamping to $\Delta t_{\text{sim}} \le 0.033$ to prevent numerical explosion during frame hitches.
 /// - Hookean restorative spring force towards rest cage configuration:
 ///   $$\mathbf{a}_k = \frac{k_{\text{stiffness}}}{m} (\mathbf{X}_{\text{rest}, k} - \mathbf{x}_k)$$
-/// - Velocity damping for smooth settling:
-///   $$\mathbf{v}_k^{t+1} = \gamma \cdot (\mathbf{v}_k^t + \mathbf{a}_k \Delta t_{\text{sim}})$$
-///   $$\mathbf{x}_k^{t+1} = \mathbf{x}_k^t + \mathbf{v}_k^{t+1} \Delta t_{\text{sim}}$$
+/// - Frame-rate independent exponential velocity damping:
+///   $$\gamma(\Delta t) = e^{-c \Delta t}, \qquad c = -\ln(\gamma_{60}) \cdot 60$$
+///   where $\gamma_{60}$ is the velocity retention per 1/60 s frame. Stepping at
+///   30 Hz, 60 Hz or 144 Hz produces the same physical trajectory.
 /// - Pinning support: Dragged vertex maintains mouse position with zero velocity.
 /// - Outward radial jiggle impulse perturbation.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,7 +22,7 @@ pub struct CageSpringSimulator {
     pub velocities: Vec<Vec3>,
     /// Spring stiffness constant $k$ (default 180.0).
     pub stiffness: f32,
-    /// Damping coefficient $\gamma \in (0, 1)$ (default 0.92).
+    /// Velocity retention per 1/60 s frame, in (0, 1) (default 0.92).
     pub damping: f32,
     /// Vertex point mass $m$ (default 1.0).
     pub mass: f32,
@@ -32,6 +33,9 @@ pub struct CageSpringSimulator {
 impl CageSpringSimulator {
     /// Maximum simulation timestep in seconds (30 Hz minimum floor) to avoid instability.
     pub const MAX_DT: f32 = 0.033;
+
+    /// Reference frame rate at which [`Self::damping`] is defined.
+    pub const DAMPING_REFERENCE_HZ: f32 = 60.0;
 
     /// Creates a new spring simulator from rest positions.
     pub fn new(rest_positions: Vec<[f32; 3]>) -> Self {
@@ -49,6 +53,21 @@ impl CageSpringSimulator {
             mass: 1.0,
             pinned_index: None,
         }
+    }
+
+    /// Converts the 60 Hz retention ratio into a continuous damping coefficient `c`.
+    ///
+    /// `gamma = exp(-c * dt)` for any `dt`, so the decay per unit of simulated
+    /// time no longer depends on how often [`Self::step`] is called.
+    pub fn damping_coefficient(damping: f32) -> f32 {
+        let retention = damping.clamp(1.0e-4, 0.9999);
+        -retention.ln() * Self::DAMPING_REFERENCE_HZ
+    }
+
+    /// Velocity retention factor for a single step of `dt` seconds.
+    #[inline]
+    pub fn frame_damping(damping: f32, dt: f32) -> f32 {
+        (-Self::damping_coefficient(damping) * dt).exp()
     }
 
     /// Sets which vertex is currently pinned by user mouse interaction.
@@ -78,7 +97,7 @@ impl CageSpringSimulator {
 
         let inv_mass = 1.0 / self.mass.max(0.001);
         let k = self.stiffness;
-        let gamma = self.damping.clamp(0.0, 0.999);
+        let gamma = Self::frame_damping(self.damping, dt_sim);
 
         for i in 0..self.current_positions.len() {
             if self.pinned_index == Some(i) {
@@ -90,7 +109,7 @@ impl CageSpringSimulator {
             let displacement = self.rest_positions[i] - self.current_positions[i];
             let accel = displacement * (k * inv_mass);
 
-            // Semi-implicit Euler integration
+            // Semi-implicit Euler integration with frame-rate independent damping
             self.velocities[i] = (self.velocities[i] + accel * dt_sim) * gamma;
             self.current_positions[i] += self.velocities[i] * dt_sim;
         }
@@ -160,7 +179,11 @@ mod tests {
 
         // Must have converged back to rest position (0, 0, 0)
         let diff = (sim.current_positions[0] - sim.rest_positions[0]).length();
-        assert!(diff < 0.05, "Spring did not converge to rest, residual: {}", diff);
+        assert!(
+            diff < 0.05,
+            "Spring did not converge to rest, residual: {}",
+            diff
+        );
     }
 
     #[test]
@@ -187,5 +210,56 @@ mod tests {
         sim.step(0.016);
         assert_eq!(sim.current_positions[0], Vec3::new(5.0, 5.0, 5.0));
         assert_eq!(sim.velocities[0], Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_damping_is_frame_rate_independent() {
+        let rest = vec![[0.0, 0.0, 0.0]];
+
+        let mut at_60 = CageSpringSimulator::new(rest.clone());
+        let mut at_120 = CageSpringSimulator::new(rest.clone());
+        let mut at_30 = CageSpringSimulator::new(rest);
+
+        at_60.current_positions[0].x = 1.0;
+        at_120.current_positions[0].x = 1.0;
+        at_30.current_positions[0].x = 1.0;
+
+        // One simulated second at three different frame rates.
+        for _ in 0..60 {
+            at_60.step(1.0 / 60.0);
+        }
+        for _ in 0..120 {
+            at_120.step(1.0 / 120.0);
+        }
+        for _ in 0..30 {
+            at_30.step(1.0 / 30.0);
+        }
+
+        let reference = at_60.current_positions[0].x;
+        assert!(
+            (at_120.current_positions[0].x - reference).abs() < 2e-2,
+            "120 Hz trajectory diverged: {} vs {}",
+            at_120.current_positions[0].x,
+            reference
+        );
+        assert!(
+            (at_30.current_positions[0].x - reference).abs() < 2e-2,
+            "30 Hz trajectory diverged: {} vs {}",
+            at_30.current_positions[0].x,
+            reference
+        );
+    }
+
+    #[test]
+    fn test_damping_coefficient_matches_reference_frame() {
+        // A retention factor of 0.92 per 60 Hz frame means one second of
+        // simulation retains 0.92^60 of the velocity.
+        let coefficient = CageSpringSimulator::damping_coefficient(0.92);
+        let one_second = (-coefficient * 1.0).exp();
+        let expected = 0.92f32.powi(60);
+        assert!(
+            (one_second - expected).abs() < 1e-5,
+            "expected {expected}, got {one_second}"
+        );
     }
 }

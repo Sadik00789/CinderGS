@@ -1,8 +1,10 @@
 mod cpu_reference;
 pub mod sh;
+pub mod sh_rotation;
 
 pub use cpu_reference::*;
 pub use sh::*;
+pub use sh_rotation::*;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -78,7 +80,7 @@ impl CompositorUniforms {
 // Compile-time static assertions
 const _: () = {
     assert!(std::mem::size_of::<CompositorUniforms>() == 48);
-    assert!(std::mem::size_of::<CompositorUniforms>().is_multiple_of(16));
+    assert!((std::mem::size_of::<CompositorUniforms>() % 16) == 0);
 };
 
 #[cfg(test)]
@@ -88,15 +90,9 @@ mod tests {
     #[test]
     fn test_compositor_uniforms_layout() {
         assert_eq!(std::mem::size_of::<CompositorUniforms>(), 48);
-        assert!(std::mem::size_of::<CompositorUniforms>().is_multiple_of(16));
+        assert!((std::mem::size_of::<CompositorUniforms>() % 16) == 0);
 
-        let uniforms = CompositorUniforms::new(
-            800,
-            600,
-            [0.1, 0.2, 0.3, 1.0],
-            [1.0, 2.0, 3.0],
-            3,
-        );
+        let uniforms = CompositorUniforms::new(800, 600, [0.1, 0.2, 0.3, 1.0], [1.0, 2.0, 3.0], 3);
 
         assert_eq!(uniforms.tiles_x, 50);
         assert_eq!(uniforms.tiles_y, 38);

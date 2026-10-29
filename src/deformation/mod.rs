@@ -6,10 +6,9 @@ pub use cpu_reference::*;
 pub use dynamics::*;
 pub use polar::*;
 
-
+use crate::parallel;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec3};
-use rayon::prelude::*;
 
 /// Indices of the 4 cage vertices defining a single tetrahedron.
 #[repr(C)]
@@ -60,6 +59,45 @@ impl GaussianBinding {
     }
 }
 
+/// Binding of a Gaussian to one of several independent cages.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct CageBinding {
+    /// Index of the owning cage, or [`Self::UNBOUND`].
+    pub cage: u32,
+    /// Tetrahedron index inside that cage.
+    pub tet: u32,
+    /// Barycentric weights `(w0, w1, w2, w3)`.
+    pub weights: [f32; 4],
+}
+
+impl CageBinding {
+    /// Sentinel cage index for a Gaussian that no cage deforms.
+    pub const UNBOUND: u32 = u32::MAX;
+
+    /// Constructs an unbound binding.
+    #[inline]
+    pub const fn unbound() -> Self {
+        Self {
+            cage: Self::UNBOUND,
+            tet: 0,
+            weights: [0.0; 4],
+        }
+    }
+
+    /// Constructs a binding to `cage`'s tetrahedron `tet`.
+    #[inline]
+    pub const fn new(cage: u32, tet: u32, weights: [f32; 4]) -> Self {
+        Self { cage, tet, weights }
+    }
+
+    /// Returns true if a cage owns this Gaussian.
+    #[inline]
+    pub fn is_bound(&self) -> bool {
+        self.cage != Self::UNBOUND
+    }
+}
+
 /// Precomputed inverse rest shape matrix $D_m^{-1}$ per tetrahedron.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -79,11 +117,13 @@ impl TetPrecomputed {
     }
 }
 
-/// Uniforms buffer for deformation and inverse-ray radiance evaluation.
+/// Uniforms buffer for deformation and SH rotation.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct DeformationUniforms {
+    /// Legacy camera position slot (kept for buffer layout stability).
     pub camera_position: [f32; 3],
+    /// Maximum SH degree whose coefficients are rotated under deformation.
     pub sh_degree: u32,
     pub num_gaussians: u32,
     pub num_tets: u32,
@@ -162,51 +202,75 @@ impl TetMesh {
         self.elements.len()
     }
 
+    /// Axis-aligned bounds of the rest cage.
+    pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        if self.rest_vertices.is_empty() {
+            return ([-0.5; 3], [0.5; 3]);
+        }
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for v in &self.rest_vertices {
+            let p = Vec3::from(*v);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        // Small padding so surface splats are not excluded by float rounding.
+        let pad = (max - min).max(Vec3::splat(1e-3)) * 1e-3;
+        ((min - pad).to_array(), (max + pad).to_array())
+    }
+
     /// Computes barycentric binding coordinates for an array of 3D points.
     ///
     /// For each point $\mathbf{p}$:
     /// 1. Finds the tetrahedron where $w_k \ge -1e-4$ for all $k \in \{0, 1, 2, 3\}$.
     /// 2. If the point lies outside all tetrahedra, selects the tetrahedron minimizing the barycentric violation penalty.
     pub fn bind_gaussians(&self, positions: &[[f32; 3]]) -> Vec<GaussianBinding> {
-        positions
-            .par_iter()
-            .map(|&p_arr| {
-                let p = Vec3::from(p_arr);
-                let mut best_tet = 0u32;
-                let mut best_penalty = f32::INFINITY;
-                let mut best_weights = [1.0f32, 0.0, 0.0, 0.0];
+        parallel::map_slice(positions, |&p_arr| self.bind_point(p_arr, None))
+    }
 
-                for (t_idx, elem) in self.elements.iter().enumerate() {
-                    let x0 = Vec3::from(self.rest_vertices[elem.indices[0] as usize]);
-                    let inv_dm = self.precomputed[t_idx].matrix();
+    fn bind_point(&self, p_arr: [f32; 3], bounds: Option<([f32; 3], [f32; 3])>) -> GaussianBinding {
+        if let Some((min, max)) = bounds {
+            let outside = (0..3).any(|axis| p_arr[axis] < min[axis] || p_arr[axis] > max[axis]);
+            if outside {
+                return GaussianBinding::unbound();
+            }
+        }
 
-                    // [w1, w2, w3]^T = D_m^{-1} * (p - X0)
-                    let delta = p - x0;
-                    let w123 = inv_dm * delta;
-                    let w1 = w123.x;
-                    let w2 = w123.y;
-                    let w3 = w123.z;
-                    let w0 = 1.0 - (w1 + w2 + w3);
+        let p = Vec3::from(p_arr);
+        let mut best_tet = 0u32;
+        let mut best_penalty = f32::INFINITY;
+        let mut best_weights = [1.0f32, 0.0, 0.0, 0.0];
 
-                    let penalty = (-w0).max(0.0)
-                        + (-w1).max(0.0)
-                        + (-w2).max(0.0)
-                        + (-w3).max(0.0);
+        for (t_idx, elem) in self.elements.iter().enumerate() {
+            let x0 = Vec3::from(self.rest_vertices[elem.indices[0] as usize]);
+            let inv_dm = self.precomputed[t_idx].matrix();
 
-                    if penalty <= 1e-4 {
-                        return GaussianBinding::new(t_idx as u32, [w0, w1, w2, w3]);
-                    }
+            // [w1, w2, w3]^T = D_m^{-1} * (p - X0)
+            let delta = p - x0;
+            let w123 = inv_dm * delta;
+            let w1 = w123.x;
+            let w2 = w123.y;
+            let w3 = w123.z;
+            let w0 = 1.0 - (w1 + w2 + w3);
 
-                    if penalty < best_penalty {
-                        best_penalty = penalty;
-                        best_tet = t_idx as u32;
-                        best_weights = [w0, w1, w2, w3];
-                    }
-                }
+            let penalty = (-w0).max(0.0) + (-w1).max(0.0) + (-w2).max(0.0) + (-w3).max(0.0);
 
-                GaussianBinding::new(best_tet, best_weights)
-            })
-            .collect()
+            if penalty <= 1e-4 {
+                return GaussianBinding::new(t_idx as u32, [w0, w1, w2, w3]);
+            }
+
+            if penalty < best_penalty {
+                best_penalty = penalty;
+                best_tet = t_idx as u32;
+                best_weights = [w0, w1, w2, w3];
+            }
+        }
+
+        if bounds.is_some() && best_penalty > 0.15 {
+            GaussianBinding::unbound()
+        } else {
+            GaussianBinding::new(best_tet, best_weights)
+        }
     }
 
     /// Computes barycentric binding coordinates, restricting active deformation strictly
@@ -218,58 +282,9 @@ impl TetMesh {
         hero_min: [f32; 3],
         hero_max: [f32; 3],
     ) -> Vec<GaussianBinding> {
-        positions
-            .par_iter()
-            .map(|&p_arr| {
-                if p_arr[0] < hero_min[0]
-                    || p_arr[0] > hero_max[0]
-                    || p_arr[1] < hero_min[1]
-                    || p_arr[1] > hero_max[1]
-                    || p_arr[2] < hero_min[2]
-                    || p_arr[2] > hero_max[2]
-                {
-                    return GaussianBinding::unbound();
-                }
-
-                let p = Vec3::from(p_arr);
-                let mut best_tet = GaussianBinding::UNBOUND;
-                let mut best_penalty = f32::INFINITY;
-                let mut best_weights = [0.0f32; 4];
-
-                for (t_idx, elem) in self.elements.iter().enumerate() {
-                    let x0 = Vec3::from(self.rest_vertices[elem.indices[0] as usize]);
-                    let inv_dm = self.precomputed[t_idx].matrix();
-
-                    let delta = p - x0;
-                    let w123 = inv_dm * delta;
-                    let w1 = w123.x;
-                    let w2 = w123.y;
-                    let w3 = w123.z;
-                    let w0 = 1.0 - (w1 + w2 + w3);
-
-                    let penalty = (-w0).max(0.0)
-                        + (-w1).max(0.0)
-                        + (-w2).max(0.0)
-                        + (-w3).max(0.0);
-
-                    if penalty <= 1e-4 {
-                        return GaussianBinding::new(t_idx as u32, [w0, w1, w2, w3]);
-                    }
-
-                    if penalty < best_penalty {
-                        best_penalty = penalty;
-                        best_tet = t_idx as u32;
-                        best_weights = [w0, w1, w2, w3];
-                    }
-                }
-
-                if best_penalty <= 0.15 {
-                    GaussianBinding::new(best_tet, best_weights)
-                } else {
-                    GaussianBinding::unbound()
-                }
-            })
-            .collect()
+        parallel::map_slice(positions, |&p_arr| {
+            self.bind_point(p_arr, Some((hero_min, hero_max)))
+        })
     }
 
     /// Computes barycentric binding coordinates for flattened `[N * 3]` positions.
@@ -323,6 +338,139 @@ impl TetMesh {
     }
 }
 
+/// A single volumetric cage with its own spring parameters and wireframe colour.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cage {
+    /// Human-readable cage name (shown in the HUD).
+    pub name: String,
+    /// Rest topology and precomputed inverse shape matrices.
+    pub mesh: TetMesh,
+    /// Independent spring physics for this cage.
+    pub simulator: CageSpringSimulator,
+    /// RGBA colour used by the wireframe overlay.
+    pub edge_color: [f32; 4],
+}
+
+impl Cage {
+    /// Creates a cage with its own simulator initialised at the rest pose.
+    pub fn new(name: impl Into<String>, mesh: TetMesh, edge_color: [f32; 4]) -> Self {
+        let simulator = CageSpringSimulator::new(mesh.rest_vertices.clone());
+        Self {
+            name: name.into(),
+            mesh,
+            simulator,
+            edge_color,
+        }
+    }
+
+    /// Current (possibly deformed) cage vertices.
+    pub fn vertices(&self) -> Vec<[f32; 3]> {
+        self.simulator.positions_array()
+    }
+
+    /// Restores the rest pose and clears velocities.
+    pub fn reset(&mut self) {
+        self.simulator.reset();
+    }
+
+    /// Applies an outward radial velocity pulse to this cage.
+    pub fn jiggle(&mut self, magnitude: f32) {
+        self.simulator.trigger_jiggle_impulse(magnitude);
+    }
+}
+
+/// A scene-wide set of independent cages plus per-Gaussian ownership.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CageScene {
+    /// Independent cages, each with its own physics parameters.
+    pub cages: Vec<Cage>,
+    /// One binding per Gaussian (by scene index), `UNBOUND` when static.
+    pub bindings: Vec<CageBinding>,
+}
+
+impl Default for CageScene {
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+}
+
+impl CageScene {
+    /// Creates a cage scene from explicit cages and bindings.
+    pub fn new(cages: Vec<Cage>, bindings: Vec<CageBinding>) -> Self {
+        Self { cages, bindings }
+    }
+
+    /// Binds every cage to the Gaussians inside its rest bounds.
+    ///
+    /// When cages overlap, the first cage in the list owns the Gaussian; later
+    /// cages claim only the splats that are still unbound. This keeps the
+    /// assignment deterministic and makes overlapping cages behave predictably.
+    pub fn auto_bind(cages: Vec<Cage>, positions: &[f32]) -> Self {
+        let count = positions.len() / 3;
+        let mut bindings = vec![CageBinding::unbound(); count];
+
+        for (cage_index, cage) in cages.iter().enumerate() {
+            let (min, max) = cage.mesh.bounds();
+            let bound = cage
+                .mesh
+                .bind_flat_positions_with_bounds(positions, min, max);
+
+            for (i, binding) in bound.iter().enumerate() {
+                if bindings[i].is_bound() || !binding.is_bound() {
+                    continue;
+                }
+                bindings[i] =
+                    CageBinding::new(cage_index as u32, binding.tet_index, binding.weights);
+            }
+        }
+
+        Self { cages, bindings }
+    }
+
+    /// Number of cages.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.cages.len()
+    }
+
+    /// Returns true when there are no cages.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.cages.is_empty()
+    }
+
+    /// Number of Gaussians that at least one cage deforms.
+    pub fn bound_count(&self) -> usize {
+        self.bindings.iter().filter(|b| b.is_bound()).count()
+    }
+
+    /// Advances every cage simulator by `dt` seconds.
+    pub fn step(&mut self, dt: f32) {
+        for cage in &mut self.cages {
+            cage.simulator.step(dt);
+        }
+    }
+
+    /// Returns the current vertex positions of every cage.
+    pub fn deformed_vertices(&self) -> Vec<Vec<[f32; 3]>> {
+        self.cages.iter().map(Cage::vertices).collect()
+    }
+
+    /// Resets every cage to its rest pose.
+    pub fn reset(&mut self) {
+        for cage in &mut self.cages {
+            cage.reset();
+        }
+    }
+
+    /// Applies a jiggle impulse to every cage.
+    pub fn jiggle(&mut self, magnitude: f32) {
+        for cage in &mut self.cages {
+            cage.jiggle(magnitude);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +481,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<TetElement>(), 16);
         assert_eq!(std::mem::size_of::<GaussianBinding>(), 20);
         assert_eq!(std::mem::size_of::<TetPrecomputed>(), 36);
+        assert_eq!(std::mem::size_of::<CageBinding>(), 24);
     }
 
     #[test]
@@ -371,5 +520,88 @@ mod tests {
         assert!((reconstructed.x - test_pt[0]).abs() < 1e-4);
         assert!((reconstructed.y - test_pt[1]).abs() < 1e-4);
         assert!((reconstructed.z - test_pt[2]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_multi_cage_auto_binding_is_deterministic_and_disjoint() {
+        let cage_a = Cage::new(
+            "left",
+            TetMesh::create_box_cage([-2.0, -1.0, -1.0], [-0.5, 1.0, 1.0]),
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let cage_b = Cage::new(
+            "right",
+            TetMesh::create_box_cage([0.5, -1.0, -1.0], [2.0, 1.0, 1.0]),
+            [0.0, 1.0, 0.0, 1.0],
+        );
+
+        // Two points inside each cage and one outside both.
+        let positions = [
+            -1.0f32, 0.0, 0.0, // cage A
+            -0.8, 0.2, 0.1, // cage A
+            1.0, 0.0, 0.0, // cage B
+            0.9, -0.3, 0.2, // cage B
+            5.0, 5.0, 5.0, // unbound
+        ];
+
+        let scene = CageScene::auto_bind(vec![cage_a, cage_b], &positions);
+        assert_eq!(scene.len(), 2);
+        assert_eq!(scene.bindings.len(), 5);
+        assert_eq!(scene.bindings[0].cage, 0);
+        assert_eq!(scene.bindings[1].cage, 0);
+        assert_eq!(scene.bindings[2].cage, 1);
+        assert_eq!(scene.bindings[3].cage, 1);
+        assert!(!scene.bindings[4].is_bound());
+        assert_eq!(scene.bound_count(), 4);
+    }
+
+    #[test]
+    fn test_cages_have_independent_physics_parameters() {
+        let cage_a = Cage::new(
+            "a",
+            TetMesh::create_box_cage([-1.0, -1.0, -1.0], [0.0, 0.0, 0.0]),
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let mut cage_b = Cage::new(
+            "b",
+            TetMesh::create_box_cage([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        cage_b.simulator.stiffness = 42.0;
+
+        let mut scene = CageScene::new(vec![cage_a, cage_b], Vec::new());
+        scene.cages[0].simulator.stiffness = 500.0;
+
+        assert_eq!(scene.cages[0].simulator.stiffness, 500.0);
+        assert_eq!(scene.cages[1].simulator.stiffness, 42.0);
+    }
+
+    #[test]
+    fn test_cage_scene_steps_and_resets() {
+        let cage = Cage::new(
+            "hero",
+            TetMesh::create_box_cage([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]),
+            [0.0, 1.0, 1.0, 0.5],
+        );
+        let mut scene = CageScene::new(vec![cage], Vec::new());
+        scene.cages[0].simulator.current_positions[0].x += 3.0;
+
+        scene.step(1.0 / 60.0);
+        let moved = scene.deformed_vertices()[0][0][0];
+        assert!(moved < 2.0, "spring should pull the vertex back");
+
+        scene.reset();
+        assert_eq!(
+            scene.deformed_vertices()[0][0],
+            scene.cages[0].mesh.rest_vertices[0]
+        );
+    }
+
+    #[test]
+    fn test_bounds_cover_vertices() {
+        let mesh = TetMesh::create_box_cage([-2.0, -3.0, -4.0], [2.0, 3.0, 4.0]);
+        let (min, max) = mesh.bounds();
+        assert!(min[0] <= -2.0 && min[1] <= -3.0 && min[2] <= -4.0);
+        assert!(max[0] >= 2.0 && max[1] >= 3.0 && max[2] >= 4.0);
     }
 }
