@@ -45,18 +45,7 @@ pub fn tile_compositor_kernel(
     let tile_id = ty * tiles_x + tx;
     let range_start = tile_ranges[tile_id as usize * 2usize];
     let range_end = tile_ranges[tile_id as usize * 2usize + 1usize];
-
-    // Empty tile handling
-    if range_start >= range_end {
-        if inside_screen {
-            let out_base = (py * screen_width + px) as usize * 4usize;
-            output_pixels[out_base] = bg_r;
-            output_pixels[out_base + 1usize] = bg_g;
-            output_pixels[out_base + 2usize] = bg_b;
-            output_pixels[out_base + 3usize] = bg_a;
-        }
-        terminate!();
-    }
+    let is_empty = range_start >= range_end;
 
     // Allocate 256-element shared memory arrays
     let mut shared_xy_x = Shared::<[f32]>::new_slice(256usize);
@@ -75,7 +64,10 @@ pub fn tile_compositor_kernel(
     let mut t = 1.0f32;
     let mut saturated = false;
 
-    let total_in_tile = range_end - range_start;
+    let mut total_in_tile = 0u32;
+    if !is_empty {
+        total_in_tile = range_end - range_start;
+    }
     let num_batches = (total_in_tile + 255u32) / 256u32;
 
     let pix_center_x = px as f32 + 0.5f32;
@@ -258,7 +250,10 @@ pub fn tile_compositor_kernel(
         let final_r = f32::clamp(c_r + t * bg_r, 0.0f32, 1.0f32);
         let final_g = f32::clamp(c_g + t * bg_g, 0.0f32, 1.0f32);
         let final_b = f32::clamp(c_b + t * bg_b, 0.0f32, 1.0f32);
-        let final_a = f32::clamp(1.0f32 - t, 0.0f32, 1.0f32);
+        let mut final_a = f32::clamp(1.0f32 - t, 0.0f32, 1.0f32);
+        if is_empty {
+            final_a = bg_a;
+        }
 
         let out_base = (py * screen_width + px) as usize * 4usize;
         output_pixels[out_base] = final_r;

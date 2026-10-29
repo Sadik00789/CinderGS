@@ -60,6 +60,30 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev libudev-dev libvulkan-dev
 
+      - name: Setup DXC for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10" -Recurse -Filter "dxcompiler.dll" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if ($dxc) {
+            $dxcDir = $dxc.DirectoryName
+            Write-Host "Found DXC in Windows Kits: $dxcDir"
+            Copy-Item "$dxcDir\dxcompiler.dll" -Destination "."
+            Copy-Item "$dxcDir\dxil.dll" -Destination "." -ErrorAction SilentlyContinue
+            echo "$dxcDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Host "Downloading DXC release fallback..."
+            $dxcDir = "$env:TEMP\dxc"
+            New-Item -ItemType Directory -Force -Path $dxcDir | Out-Null
+            $url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2502/dxc_2025_02_28.zip"
+            Invoke-WebRequest -Uri $url -OutFile "$dxcDir\dxc.zip"
+            Expand-Archive -Path "$dxcDir\dxc.zip" -DestinationPath $dxcDir -Force
+            Copy-Item "$dxcDir\bin\x64\dxcompiler.dll" -Destination "."
+            Copy-Item "$dxcDir\bin\x64\dxil.dll" -Destination "." -ErrorAction SilentlyContinue
+            echo "$dxcDir\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          echo "WGPU_DX12_COMPILER=dxc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -88,6 +112,30 @@ jobs:
             libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev libudev-dev libvulkan-dev
+
+      - name: Setup DXC for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10" -Recurse -Filter "dxcompiler.dll" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if ($dxc) {
+            $dxcDir = $dxc.DirectoryName
+            Write-Host "Found DXC in Windows Kits: $dxcDir"
+            Copy-Item "$dxcDir\dxcompiler.dll" -Destination "."
+            Copy-Item "$dxcDir\dxil.dll" -Destination "." -ErrorAction SilentlyContinue
+            echo "$dxcDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Host "Downloading DXC release fallback..."
+            $dxcDir = "$env:TEMP\dxc"
+            New-Item -ItemType Directory -Force -Path $dxcDir | Out-Null
+            $url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2502/dxc_2025_02_28.zip"
+            Invoke-WebRequest -Uri $url -OutFile "$dxcDir\dxc.zip"
+            Expand-Archive -Path "$dxcDir\dxc.zip" -DestinationPath $dxcDir -Force
+            Copy-Item "$dxcDir\bin\x64\dxcompiler.dll" -Destination "."
+            Copy-Item "$dxcDir\bin\x64\dxil.dll" -Destination "." -ErrorAction SilentlyContinue
+            echo "$dxcDir\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          echo "WGPU_DX12_COMPILER=dxc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
