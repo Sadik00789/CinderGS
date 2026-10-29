@@ -9,7 +9,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85+-blue.svg?style=flat-square&logo=rust)](Cargo.toml)
 [![WGPU 30](https://img.shields.io/badge/WGPU-v30.0-blue.svg?style=flat-square&logo=webgpu)](https://wgpu.rs/)
 [![CubeCL 0.11](https://img.shields.io/badge/CubeCL-v0.11-darkgreen.svg?style=flat-square)](https://cubecl.org/)
-[![Tests](https://img.shields.io/badge/Tests-142%20passing-brightgreen.svg?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-143%20passing-brightgreen.svg?style=flat-square)](tests/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20WASM-lightgrey.svg?style=flat-square)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=flat-square)](LICENSE)
 
@@ -50,7 +50,7 @@ Whether ingesting multi-million Gaussian captures from raw PLY files, deforming 
 | **Volumetric Cage Kinematics** | • Tetrahedral cage meshes with automatic barycentric coordinate embedding.<br>• Closed-form covariance transport `Σ' = J Σ Jᵀ` with regularization against degeneracy.<br>• Optical density stabilization: `α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))`.<br>• Exact monomial SH rotation matrices for bands 1–3 via polar decomposition `J = R S`.<br>• Multi-cage support with individual stiffness, damping, rest configurations, and wireframes. |
 | **Physics & Dynamics** | • Semi-implicit Euler spring solver with frame-rate independent exponential damping (`γ = exp(−c Δt)`).<br>• Real-time screen-space cage vertex picking and camera-plane dragging.<br>• Automated jiggle excitation and settling simulations. |
 | **Sorting & Caching** | • Deterministic 64-bit `(tile_id, depth_key)` parallel sorting.<br>• **Sort Cache Optimization**: Reuses tile ordering across frames when camera and cages are static, avoiding redundant passes during inspection. |
-| **PLY Ingestion Engine** | • Robust schema-driven header parser (`binary_little_endian` and `binary_big_endian`).<br>• Handles `float` and `double` scalars, arbitrary property orderings, and custom attributes.<br>• High-throughput zero-copy `mmap` fast path for canonical 62-float buffers.<br>• Rich error diagnostics through dedicated `PlyError` variants. |
+| **PLY Ingestion Engine** | • Robust schema-driven header parser (`binary_little_endian` and `binary_big_endian`).<br>• Handles `float` and `double` scalars, arbitrary property orderings, and custom attributes.<br>• Spherical harmonics degrees 0–3 (9/24/45 `f_rest` coefficients) repacked into the engine's 15-per-channel layout.<br>• High-throughput zero-copy `mmap` fast path for canonical 62-float buffers.<br>• Rich error diagnostics through dedicated `PlyError` variants. |
 | **Intelligent Auto-Framing** | • Statistical outlier rejection via 2nd/98th percentile bounding box trimming.<br>• Automatic derivation of hero cage dimensions, orbit pivot, and focal distance.<br>• Explicit CLI override flags (`--look-at`, `--distance`, `--bounds`) for room-scale captures. |
 | **Production Tooling** | • **Headless Render Farm** (`render`): Scriptable offline renderer reading JSON camera paths.<br>• **Autonomous Demo Recorder** (`record_demo`): Frame generator with automatic MP4/GIF encoding.<br>• **Interactive Timeline**: Keyframed camera trajectories and cage deformations with live scrubbing.<br>• **WebAssembly Drop-Zone**: In-browser PLY validation and inspection with zero network transmission. |
 
@@ -177,7 +177,7 @@ Benchmarked via `cargo run --release --bin benchmark` under identical workload c
 git clone https://github.com/Sadik00789/CinderGS.git
 cd CinderGS
 
-# Run unit and integration tests (142 tests)
+# Run unit and integration tests (143 tests)
 cargo test --all-targets
 
 # Strict zero-warning lint check
@@ -308,7 +308,8 @@ CinderGS/
 │   │   └── render.rs       # Headless batch render farm binary
 │   ├── deformation/        # Physics engine & volumetric kinematics
 │   │   ├── cpu_reference.rs# Reference deformation pipeline
-│   │   ├── dynamics.rs     # Tetrahedral cage mesh, barycentric bindings & springs
+│   │   ├── dynamics.rs     # Frame-rate independent spring simulator
+│   │   ├── mod.rs          # Cage meshes, barycentric bindings & multi-cage scene
 │   │   └── polar.rs        # Polar decomposition and exact SH rotation matrices
 │   ├── math/               # Mathematical primitives: activations, covariances, EWA splats
 │   ├── parallel/           # Abstract parallel iterators (Rayon / Sequential fallback)
@@ -318,10 +319,10 @@ CinderGS/
 │   │   ├── gpu_bridge.rs   # CubeCL-to-WGPU buffer synchronization
 │   │   ├── kernels/        # CubeCL GPU compute kernels (deformation, EWA, compositor)
 │   │   ├── rasterizer/     # 16x16 tile compositor, SH math, and sort caching
-│   │   └── wireframe/      # Dynamic cage edge and vertex handle rendering
+│   │   └── wireframe.rs    # Dynamic cage edge and vertex handle rendering
 │   ├── scene/              # Data ingestion & scene analysis
 │   │   ├── autoframe.rs    # Percentile-based bounding box & camera framing
-│   │   ├── loader.rs       # Universal schema-driven binary PLY loader
+│   │   ├── ply_loader.rs   # Schema-driven binary PLY loader with SH degree support
 │   │   └── synthetic.rs    # Procedural Fibonacci sphere scene generator
 │   ├── lib.rs              # Engine library root and public API
 │   ├── main.rs             # Desktop application entry point
