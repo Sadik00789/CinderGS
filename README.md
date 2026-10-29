@@ -46,9 +46,9 @@ Whether ingesting multi-million Gaussian captures from raw PLY files, deforming 
 
 | Domain | Capability Highlights |
 | :--- | :--- |
-| **GPU Compute & Rasterization** | • Native compute kernels via **CubeCL 0.11** targeting Vulkan, Metal, and DirectX 12.<br>• Exact **CPU reference backend** with multi-threaded Rayon execution.<br>• **Unified device model**: single `wgpu::Device` and `Queue` shared across compute kernels and swapchain surface.<br>• 256-thread shared-memory $16 \times 16$ tile compositor with early ray termination ($\alpha > 0.9999$).<br>• Full world-space Spherical Harmonics (SH) evaluation across degrees 0 to 3. |
-| **Volumetric Cage Kinematics** | • Tetrahedral cage meshes with automatic barycentric coordinate embedding.<br>• Closed-form covariance transport $\mathbf{\Sigma}' = \mathbf{J} \mathbf{\Sigma} \mathbf{J}^\top$ with regularization against degeneracy.<br>• Optical density stabilization: $\alpha' = 1 - (1 - \alpha)^{1 / \text{clamp}(\det \mathbf{J}, 0.6, 1.8)}$.<br>• Exact monomial SH rotation matrices for bands 1–3 via polar decomposition $\mathbf{J} = \mathbf{R} \mathbf{S}$.<br>• Multi-cage support with individual stiffness, damping, rest configurations, and wireframes. |
-| **Physics & Dynamics** | • Semi-implicit Euler spring solver with frame-rate independent exponential damping ($\gamma = \exp(-c \Delta t)$).<br>• Real-time screen-space cage vertex picking and camera-plane dragging.<br>• Automated jiggle excitation and settling simulations. |
+| **GPU Compute & Rasterization** | • Native compute kernels via **CubeCL 0.11** targeting Vulkan, Metal, and DirectX 12.<br>• Exact **CPU reference backend** with multi-threaded Rayon execution.<br>• **Unified device model**: single `wgpu::Device` and `Queue` shared across compute kernels and swapchain surface.<br>• 256-thread shared-memory 16×16 tile compositor with early ray termination (α > 0.9999).<br>• Full world-space Spherical Harmonics (SH) evaluation across degrees 0 to 3. |
+| **Volumetric Cage Kinematics** | • Tetrahedral cage meshes with automatic barycentric coordinate embedding.<br>• Closed-form covariance transport `Σ' = J Σ Jᵀ` with regularization against degeneracy.<br>• Optical density stabilization: `α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))`.<br>• Exact monomial SH rotation matrices for bands 1–3 via polar decomposition `J = R S`.<br>• Multi-cage support with individual stiffness, damping, rest configurations, and wireframes. |
+| **Physics & Dynamics** | • Semi-implicit Euler spring solver with frame-rate independent exponential damping (`γ = exp(−c Δt)`).<br>• Real-time screen-space cage vertex picking and camera-plane dragging.<br>• Automated jiggle excitation and settling simulations. |
 | **Sorting & Caching** | • Deterministic 64-bit `(tile_id, depth_key)` parallel sorting.<br>• **Sort Cache Optimization**: Reuses tile ordering across frames when camera and cages are static, avoiding redundant passes during inspection. |
 | **PLY Ingestion Engine** | • Robust schema-driven header parser (`binary_little_endian` and `binary_big_endian`).<br>• Handles `float` and `double` scalars, arbitrary property orderings, and custom attributes.<br>• High-throughput zero-copy `mmap` fast path for canonical 62-float buffers.<br>• Rich error diagnostics through dedicated `PlyError` variants. |
 | **Intelligent Auto-Framing** | • Statistical outlier rejection via 2nd/98th percentile bounding box trimming.<br>• Automatic derivation of hero cage dimensions, orbit pivot, and focal distance.<br>• Explicit CLI override flags (`--look-at`, `--distance`, `--bounds`) for room-scale captures. |
@@ -106,17 +106,31 @@ CinderGS processes scenes through a staged pipeline designed to maximize through
 
 ### Mathematical Foundations
 
-1. **Barycentric Embedding**: Each Gaussian center $\mathbf{x} \in \mathbb{R}^3$ inside a cage tetrahedron with rest vertices $\mathbf{X}_k$ is mapped to deformed coordinates $\mathbf{x}'$ via precomputed weights $w_k$:
-   $$\mathbf{x}' = \sum_{k=1}^4 w_k \mathbf{X}'_k, \quad \sum_{k=1}^4 w_k = 1$$
+#### 1. Barycentric Embedding
+Each Gaussian center $`\mathbf{x} \in \mathbb{R}^3`$ inside a cage tetrahedron with rest vertices $`\mathbf{X}_k`$ is mapped to deformed coordinates $`\mathbf{x}'`$ via precomputed weights $`w_k`$:
 
-2. **Covariance Transport**: With deformed edge matrix $\mathbf{D}_s$ and rest edge matrix $\mathbf{D}_m$, the Jacobi deformation gradient is $\mathbf{J} = \mathbf{D}_s \mathbf{D}_m^{-1}$. The 3D Gaussian covariance $\mathbf{\Sigma}$ transports as:
-   $$\mathbf{\Sigma}' = \mathbf{J} \mathbf{\Sigma} \mathbf{J}^\top$$
-   The resulting tensor is symmetrized and regularized with a minimum diagonal floor of $10^{-4}$ to avoid degenerate splats.
+```math
+\mathbf{x}' = \sum_{k=1}^4 w_k \mathbf{X}'_k, \quad \sum_{k=1}^4 w_k = 1
+```
 
-3. **Opacity Stabilization**: When a tetrahedron expands or compresses, the apparent volumetric density changes. CinderGS preserves visual optical thickness by scaling opacity $\alpha$:
-   $$\alpha' = 1 - (1 - \alpha)^{\frac{1}{\text{clamp}(\det \mathbf{J},\, 0.6,\, 1.8)}}$$
+#### 2. Covariance Transport
+With deformed edge matrix $`\mathbf{D}_s`$ and rest reference edge matrix $`\mathbf{D}_m`$, the Jacobi deformation gradient is $`\mathbf{J} = \mathbf{D}_s \mathbf{D}_m^{-1}`$. The 3D Gaussian covariance matrix $`\mathbf{\Sigma}`$ transports as:
 
-4. **Spherical Harmonics Rotation**: Monomial rotation representations for degree 1 ($3 \times 3$), degree 2 ($5 \times 5$), and degree 3 ($7 \times 7$) are evaluated using the polar rotation factor $\mathbf{R}$ from $\mathbf{J} = \mathbf{R} \mathbf{S}$, ensuring view-dependent color stays consistent under large rotational deformations.
+```math
+\mathbf{\Sigma}' = \mathbf{J} \mathbf{\Sigma} \mathbf{J}^\top
+```
+
+The resulting tensor is symmetrized and regularized with a minimum diagonal floor of $`10^{-4}`$ to avoid degenerate splats.
+
+#### 3. Opacity Stabilization
+When a tetrahedron expands or compresses, the apparent volumetric density changes. CinderGS preserves visual optical thickness by scaling opacity $`\alpha`$:
+
+```math
+\alpha' = 1 - (1 - \alpha)^{\frac{1}{\operatorname{clamp}(\det \mathbf{J},\, 0.6,\, 1.8)}}
+```
+
+#### 4. Spherical Harmonics Rotation
+Monomial rotation representations for degree 1 (3×3), degree 2 (5×5), and degree 3 (7×7) are evaluated using the polar rotation factor $`\mathbf{R}`$ from $`\mathbf{J} = \mathbf{R} \mathbf{S}`$, ensuring view-dependent color stays consistent under large rotational deformations.
 
 ### Unified Device Model
 
@@ -131,7 +145,7 @@ CinderGS processes scenes through a staged pipeline designed to maximize through
 
 Benchmarked via `cargo run --release --bin benchmark` under identical workload conditions:
 
-- **Workload**: 100,000 synthetic Gaussians at $1920 \times 1080$ resolution (~1.5 million generated tile entries)
+- **Workload**: 100,000 synthetic Gaussians at 1920×1080 resolution (~1.5 million generated tile entries)
 - **CPU**: 12 execution threads (Rayon work-stealing pool)
 - **GPU**: NVIDIA GeForce RTX 3050 Laptop GPU (Vulkan backend, CubeCL 0.11)
 
@@ -217,7 +231,7 @@ cargo run --release --bin render -- \
 }
 ```
 
-*Keyframes undergo spherical interpolation for yaw and linear interpolation for target and camera positions. If `--camera-path` is omitted, the renderer generates a smooth $360^\circ$ orbit around the automatically framed target.*
+*Keyframes undergo spherical interpolation for yaw and linear interpolation for target and camera positions. If `--camera-path` is omitted, the renderer generates a smooth 360° orbit around the automatically framed target.*
 
 ---
 
@@ -267,7 +281,7 @@ Drop any 3DGS `.ply` file onto the browser window to inspect Gaussian counts, sc
 
 - **Backend Toggle**: Switch live between `CubeCL GPU` and `CPU Reference`.
 - **SH Degree**: Dynamically clamp spherical harmonics evaluation (0, 1, 2, or 3).
-- **Cage Controls**: Toggle wireframe, adjust spring stiffness ($k$) and exponential damping ($\gamma$), trigger excitation jiggles, or reset poses.
+- **Cage Controls**: Toggle wireframe, adjust spring stiffness ($`k`$) and exponential damping ($`\gamma`$), trigger excitation jiggles, or reset poses.
 - **Timeline Controls**: Record camera poses and cage states into keyframes, scrub playhead, or trigger animated playback.
 
 ---
