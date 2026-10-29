@@ -1,7 +1,8 @@
 [package]
 name = "cinder_gs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["CinderGS Engine Team"]
 license = "MIT"
 description = "High-performance production-grade 3D Gaussian Splatting engine core"
@@ -9,22 +10,44 @@ description = "High-performance production-grade 3D Gaussian Splatting engine co
 [dependencies]
 glam = "0.28"
 bytemuck = { version = "1.18", features = ["derive", "min_const_generics"] }
-memmap2 = "0.9"
 anyhow = "1.0"
 thiserror = "1.0"
-rayon = "1.10"
 cubecl = { version = "0.11.0", features = ["wgpu"] }
 cubecl-common = "0.11.0"
 winit = { version = "0.30", features = ["rwh_06"] }
-egui = "0.28"
-egui-winit = "0.28"
-egui-wgpu = "0.28"
-wgpu = "0.20"
+egui = "0.37"
+egui-wgpu = "0.37"
+# Keep this in lock-step with the wgpu version that `cubecl-wgpu` links
+# (cubecl 0.11 -> wgpu 30). A single wgpu Device/Queue then serves both the
+# presentation surface and the compute kernels.
+wgpu = "30.0.1"
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
 
-
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "stages"
+harness = false
+
+# The WGPU/CubeCL dependency graph is large; full debuginfo on dev builds
+# exhausts the page file on constrained Windows machines. Keep dev/test builds
+# lean and rely on `RUSTFLAGS` when detailed debugging is needed.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
