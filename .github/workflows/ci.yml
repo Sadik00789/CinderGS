@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  clippy:
-    name: Clippy & Linter
+  lint:
+    name: Format & Clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,7 +21,10 @@ jobs:
       - name: Install system dependencies (Linux WGPU/Winit)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libx11-dev libxkbcommon-dev libasound2-dev libudev-dev
+          sudo apt-get install -y \
+            libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libudev-dev pkg-config libvulkan-dev
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -30,6 +33,9 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Run Cargo Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -49,7 +55,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libx11-dev libxkbcommon-dev libasound2-dev libudev-dev
+          sudo apt-get install -y \
+            libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libudev-dev libvulkan-dev
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,7 +84,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libx11-dev libxkbcommon-dev libasound2-dev libudev-dev
+          sudo apt-get install -y \
+            libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libudev-dev libvulkan-dev
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -83,7 +95,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Release Binary
+      - name: Build Release Binaries
         run: cargo build --release
 
       - name: Upload Binary Artifact
@@ -93,4 +105,10 @@ jobs:
           path: |
             target/release/cinder_gs
             target/release/cinder_gs.exe
+            target/release/benchmark
+            target/release/benchmark.exe
+            target/release/render
+            target/release/render.exe
+            target/release/record_demo
+            target/release/record_demo.exe
           if-no-files-found: ignore

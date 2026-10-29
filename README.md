@@ -1,306 +1,272 @@
-# CinderGS: Native 3D Gaussian Splatting Engine with Volumetric Cage Kinematics
+# CinderGS
+
+Native 3D Gaussian Splatting with volumetric cage kinematics, written in pure Rust.
 
 [![Rust Edition 2024](https://img.shields.io/badge/Rust_Edition-2024-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![WGPU 22](https://img.shields.io/badge/WGPU-v22-blue.svg?style=flat-square&logo=webgpu)](https://wgpu.rs/)
+[![WGPU 30](https://img.shields.io/badge/WGPU-v30-blue.svg?style=flat-square&logo=webgpu)](https://wgpu.rs/)
 [![CubeCL 0.11](https://img.shields.io/badge/CubeCL-v0.11-darkgreen.svg?style=flat-square)](https://cubecl.org/)
-[![CUDA/C++ Free](https://img.shields.io/badge/C%2B%2B%2FCUDA-Zero_Dependencies-success.svg?style=flat-square)](https://github.com/Sadik00789/CinderGS)
+[![Tests](https://img.shields.io/badge/Tests-142%20passing-brightgreen.svg?style=flat-square)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=flat-square)](LICENSE)
 [![CI](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml/badge.svg)](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml)
-[![Tests Passing](https://img.shields.io/badge/Tests-86%20Passed-brightgreen.svg?style=flat-square)](tests/integration_tests.rs)
 
 <div align="center">
-  <img src="docs/cindergs_demo.gif" alt="CinderGS Real-Time Deformation Demo" width="100%">
-  <p><em>Real-time 3D Gaussian Splatting with interactive volumetric cage kinematics and damped spring jiggle physics at 101.9 FPS on an RTX 3050 Laptop GPU.</em></p>
+  <img src="docs/cindergs_demo.gif" alt="CinderGS real-time Gaussian Splatting deformation demo" width="100%">
+  <p><em>Volumetric cage kinematics on the Mip-NeRF 360 bonsai capture: the canopy ruffles while the trunk and pot stay anchored. Rendered with the CubeCL backend on an NVIDIA GeForce RTX 3050 Laptop GPU.</em></p>
 </div>
 
-**CinderGS** is an ultra-high-performance, state-of-the-art 3D Gaussian Splatting (3DGS) rasterization and volumetric deformation engine written entirely in pure Rust. Built on top of **CubeCL** and **WGPU**, CinderGS completely eliminates legacy C++, CUDA toolkit, LibTorch, and Inria native extensions in favor of fully portable, multi-backend GPU compute kernels that run natively across Linux (Vulkan), macOS (Metal), and Windows (DirectX 12 / Vulkan).
+CinderGS is a 3D Gaussian Splatting renderer and deformation engine written entirely
+in Rust. It ingests standard 3DGS PLY captures, deforms Gaussians with tetrahedral
+cages, orders them per 16×16 tile, and composites them with either a CPU reference
+backend or CubeCL compute kernels sharing a single WGPU device with the viewport.
 
----
+## Features
 
-## Key Architectural Innovations
+| Area | Implementation |
+| :--- | :--- |
+| PLY ingestion | Schema-driven header parser: `binary_little_endian` and `binary_big_endian`, `float`/`double`, arbitrary property order, SH degrees 0–3, zero-copy `mmap` fast path for the canonical 62-float layout |
+| Automatic framing | 2nd/98th percentile per axis, plus explicit `--look-at` / `--distance` / `--bounds` overrides |
+| Stage 1 — deformation | CPU (all cages) or GPU (one pass per cage): barycentric position mapping, covariance transport, opacity stabilization, SH rotation on the CPU path |
+| Stage 2 — projection | EWA 3D-to-2D projection, conic inversion, frustum culling on CPU or GPU |
+| Stage 3 — binning | 16×16 tile overlap counting, 64-bit `(tile, depth)` keys, parallel sort, tile ranges (CPU) |
+| Stage 4 — compositor | 256-thread shared-memory tile compositor on CPU or GPU, world-space SH degrees 0–3, early ray termination |
+| Multi-cage | Independent cages with their own meshes, bindings, spring parameters and wireframe colours |
+| Sort cache | Reuses tile ordering across frames while camera and cages are static |
+| Viewport | winit + egui HUD, orbit/pan/zoom, cage picking and dragging, HiDPI input |
+| Timeline | Camera + cage keyframes with playback and scrubbing |
+| Headless | Render farm CLI with camera-path JSON, demo recorder to PNG/MP4/GIF |
+| WebAssembly | PLY ingestion entry point and browser drop-zone (`web/index.html`) |
 
-1. **Pure Rust & CubeCL Compute Pipeline:**
-   - Full elimination of external CUDA runtime, `nvcc`, Python bindings, and LibTorch.
-   - Compute kernels written in CubeCL compile just-in-time to SPIR-V, WGSL, and native GPU bytecode across any hardware vendor.
-2. **Zero-Copy Memory-Mapped PLY Ingestion:**
-   - Sequential little-endian binary header and attribute streaming via `memmap2` and `bytemuck`.
-   - Ingests over **2,000,000 raw Gaussian splats in under 85 ms** (62 properties per vertex, 248 bytes/vertex).
-3. **Real-Time Volumetric Cage Kinematics & Hero Isolation:**
-   - Arbitrary mesh deformation using a localized 5-tetrahedron hero cage with barycentric coordinates $\mathbf{w}_i = (w_0, w_1, w_2, w_3)$ and `u32::MAX` sentinel handling that keeps background splats 100% static and opaque.
-   - Affine covariance deformation: $\Sigma' = J \Sigma_{\text{rest}} J^T$ computed per splat.
-   - Energy-conserving volumetric opacity stabilization: hard-bounded volume dilation $\alpha' = 1 - (1 - \alpha)^{1 / s_{\text{det}}}$ $(s_{\text{det}} = \mathrm{clamp}(\det(J), 0.6, 1.8))$, preventing stretched splats from evaporating into transparency.
-4. **Inverse-Ray Spherical Harmonics Evaluation:**
-   - Rotates the viewing direction into local tetrahedral reference coordinates $(\mathbf{d}_ {\text{local}} = R^T \mathbf{d}_ {\text{world}})$ using Higham polar decomposition $R \in \mathrm{SO}(3)$, bypassing costly Wigner D-matrix rotations on 48 SH coefficients.
-5. **Cooperative Shared-Memory Tile Compositor:**
-   - Viewport partitioned into $16 \times 16$ pixel workgroups.
-   - 256-thread cooperative tile fetching into GPU shared memory with deadlock-free barrier synchronization and early ray termination $(\mathcal{T} < 10^{-4})$.
-6. **Damped Spring Cage Dynamics:**
-   - Interactive Hookean spring physics with timestep clamping $(\Delta t_{\text{sim}} \le 0.033\text{ s})$ preventing numerical instability during hitching.
-   - Unpinned vertices physically oscillate and settle when dragged cage handles are released, accompanied by radial jiggle impulse perturbations.
-
----
-
-## System Architecture & Frame Graph
-
-### A. High-Level Engine Pipeline
+## Frame graph
 
 ```
-  +--------------------------------------------------------------------------+
-  |                             CinderGS Engine                              |
-  +--------------------------------------------------------------------------+
-       |
-       | 1. Memory-Mapped Streaming
-       v
-  +-------------------------+      Padded AABB      +------------------------+
-  |    PlyLoader (mmap)     | --------------------> | 5-Tet Cage Generation  |
-  |  (248B/vtx, Zero-Copy)  |                       |  (TetMesh / Bounding)  |
-  +-------------------------+                       +------------------------+
-       |                                                         |
-       | Structure-of-Arrays (SoA)                               | Barycentric Bind
-       v                                                         v
-  +--------------------------------------------------------------------------+
-  |                      RenderPipelineOrchestrator                          |
-  |  [ExecutionBackend: CpuReference  <--->  ExecutionBackend: CubeClGpu]    |
-  +--------------------------------------------------------------------------+
-       |
-       +---> Stage 1: Volumetric Cage Deformation (J = Ds * Dm^-1, R in SO(3))
-       |
-       +---> Stage 2: Camera Frustum EWA 3D-to-2D Projection & Conics
-       |
-       +---> Stage 3: Monotonic 64-bit Tile-Depth Key Generation & Radix Sort
-       |
-       +---> Stage 4: Shared-Memory 16x16 Cooperative Tile Compositor
-       |
-       +---> Stage 5: Fullscreen Blit to Presentation Swapchain
-       |
-       +---> Stage 6: Line-List Wireframe & Diamond Billboard Handles Overlay
-       |
-       v
-  +--------------------------------------------------------------------------+
-  |                    WGPU Swapchain Surface + egui HUD                     |
-  +--------------------------------------------------------------------------+
+ PLY capture ──► schema parser ──► GaussianSceneSoa
+                                        │
+                                        ▼
+                         ┌───────────────────────────────┐
+                         │  CageScene (N cages)          │
+                         │  per-cage spring simulation   │
+                         └──────────────┬────────────────┘
+                                        │ barycentric bindings
+                                        ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ Stage 1  Deformation                                                 │
+ │   x' = Σ wₖ Xₖ                                                       │
+ │   Σ' = J Σ Jᵀ,   J = Dₛ Dₘ⁻¹                                        │
+ │   α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))                      │
+ │   SH coefficients rotated by the polar rotation R (CPU path)         │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ Stage 2  EWA projection + conic radius                               │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ Stage 3  16×16 tile binning + 64-bit (tile, depth) sort      [CPU]   │
+ │   cached while camera and cages are static                           │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ Stage 4  Shared-memory 16×16 tile compositor                         │
+ │   world-space SH evaluation, degrees 0–3                             │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ Stage 5  sRGB offscreen texture + fullscreen blit                    │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ Stage 6  Cage wireframe + handles, then egui HUD                     │
+ └──────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+                                WGPU swapchain
 ```
 
-### B. Frame Execution Graph
+Stages 1, 2 and 4 run on either backend. Stage 3 executes on the CPU, which keeps
+the 64-bit key construction, sorting and tile-range extraction deterministic and
+lets the cache reuse them without a GPU round-trip.
 
-```
-[Start Frame Tick]
-        |
-        v
- [Orbit Camera / Cage Picker] ---> Process Window Mouse & Pan Events
-        |
-        v
- [Cage Spring Simulator] --------> Timestep Clamped Semi-Implicit Euler
-        |                          x_k^(t+1) = x_k^t + v_k^(t+1) * dt_sim
-        v
- [Compute Tet Jacobians] --------> J = D_s * D_m^-1, R = HighamPolar(J)
-        |
-        v
- [Deform Gaussians Kernel] ------> x' = Sum(w_k * x_vk), Sigma' = J * Sigma * J^T
-        |                          alpha' = 1 - (1 - alpha)^(1/det(J))
-        v
- [Project Gaussians Kernel] -----> View transform, J_proj, Sigma_2D, Conic (a,b,c)
-        |
-        v
- [Tile Binning & Sort] ----------> 16x16 tile overlap count, 64-bit Radix Sort
-        |
-        v
- [Tile Compositor Kernel] -------> Shared-memory tile rasterization into offscreen buffer
-        |
-        v
- [Fullscreen Blit Pipeline] -----> Texture upload & fullscreen quad blit
-        |
-        v
- [Wireframe Pass] ---------------> Line-list cyan cage edges + gold diamond handles
-        |
-        v
- [egui HUD Overlay] -------------> FPS, telemetry, spring physics sliders, backend switch
-        |
-        v
-  [Present Frame]
-```
+### Device model
 
----
+`wgpu` is pinned to 30.0.1 — the version linked by CubeCL 0.11. `GpuCompute`
+registers the presentation `wgpu::Device` and `Queue` with the CubeCL runtime, so
+one instance, adapter, device and queue serve both the swapchain and the compute
+kernels. The compute client is created once and reused for the lifetime of the
+process.
 
-## Mathematical Formulations
+## Measured performance
 
-### 1. 3D Covariance Matrix Construction
+Measured with `cargo run --release --bin benchmark` on:
 
-From optimized raw quaternion rotation $\mathbf{q} \in \mathbb{H}$ and logarithmic scale factors $\mathbf{s} \in \mathbb{R}^3$:
+- 100,000 synthetic Gaussians, 1920×1080
+- 12 CPU threads (Rayon)
+- NVIDIA GeForce RTX 3050 Laptop GPU, Vulkan backend, CubeCL 0.11
 
-$$
-\hat{\mathbf{q}} = \begin{cases} 
-\begin{bmatrix} 0 & 0 & 0 & 1 \end{bmatrix}^T & \text{if } \|\mathbf{q}\| < 10^{-6} \\ 
-\frac{\mathbf{q}}{\|\mathbf{q}\|} & \text{otherwise} 
-\end{cases}
-$$
+| Stage | CPU reference | CubeCL GPU (dispatch + readback) |
+| :--- | ---: | ---: |
+| 1 — Cage deformation | 5.31 ms | 9.48 ms |
+| 2 — EWA projection | 1.14 ms | 7.20 ms |
+| 3 — Tile binning + sort (CPU) | 31.12 ms | 28.91 ms |
+| 4 — Tile compositor | 239.06 ms | 91.38 ms |
+| **Sum of stages** | **276.63 ms** | **136.98 ms** |
+| End-to-end frame (upload + blit) | 252.93 ms (4.0 FPS) | 108.36 ms (9.2 FPS) |
 
-$$
-\mathbf{s}_{\text{clamped}} = \max(\exp(\mathbf{s}), 10^{-4})
-$$
+End-to-end is lower than the stage sum because the benchmark reuses the Stage 3
+sort while the camera and cages are static. This workload produces ~1.5 million
+tile entries, so the compositor dominates. `cargo bench --bench stages` measures
+the individual CPU stages under Criterion.
 
-$$
-\Sigma = R(\hat{\mathbf{q}}) \cdot \mathrm{diag}(\mathbf{s}_{\text{clamped}}^2) \cdot R(\hat{\mathbf{q}})^T \succ 0
-$$
+## Build and run
 
-### 2. EWA Perspective Projection & Conics
+Requirements:
 
-Given world-to-camera transform $W \in \mathbb{R}^{4 \times 4}$, camera-space position $\mathbf{t} = W \cdot \mathbf{p}$, and projection Jacobian $J_{\text{proj}}$:
+- Rust 1.85 or newer (edition 2024)
+- A Vulkan, Metal or DirectX 12 driver
 
-$$
-J_{\text{proj}} = \begin{bmatrix} 
-\frac{f_x}{t_z} & 0 & -\frac{f_x t_x}{t_z^2} \\ 
-0 & \frac{f_y}{t_z} & -\frac{f_y t_y}{t_z^2} 
-\end{bmatrix}
-$$
-
-$$
-\Sigma_{\text{cam}} = W_{3 \times 3} \Sigma W_{3 \times 3}^T, \quad \Sigma_{2D} = J_{\text{proj}} \Sigma_{\text{cam}} J_{\text{proj}}^T + \begin{bmatrix} 0.3 & 0 \\ 0 & 0.3 \end{bmatrix}
-$$
-
-$$
-\det(\Sigma_{2D}) = \Sigma_{2D, 00} \Sigma_{2D, 11} - \Sigma_{2D, 01}^2
-$$
-
-$$
-\mathbf{c}_{\text{conic}} = \begin{bmatrix} a \\ b \\ c \end{bmatrix} = \frac{1}{\det(\Sigma_{2D})} \begin{bmatrix} \Sigma_{2D, 11} \\ -\Sigma_{2D, 01} \\ \Sigma_{2D, 00} \end{bmatrix}
-$$
-
-$$
-\lambda_{\max} = \frac{\Sigma_{2D, 00} + \Sigma_{2D, 11}}{2} + \sqrt{\left(\frac{\Sigma_{2D, 00} - \Sigma_{2D, 11}}{2}\right)^2 + \Sigma_{2D, 01}^2}
-$$
-
-$$
-r = \mathrm{clamp}\left(\lceil 3.0 \sqrt{\lambda_{\max}} \rceil, 1, 1024\right)
-$$
-
-### 3. Volumetric Cage Kinematics
-
-Each Gaussian $i$ is bound to tetrahedron $\text{tet} = (v_0, v_1, v_2, v_3)$ via barycentric coordinates $\mathbf{w}_i$:
-
-$$
-\mathbf{x}'_i = \sum_{k=0}^3 w_{i, k} \mathbf{x}_{v_k}, \quad D_s = \begin{bmatrix} \mathbf{x}_{v_1} - \mathbf{x}_{v_0} & \mathbf{x}_{v_2} - \mathbf{x}_{v_0} & \mathbf{x}_{v_3} - \mathbf{x}_{v_0} \end{bmatrix}
-$$
-
-$$
-J = D_s D_m^{-1}, \quad \Sigma' = J \Sigma_{\text{rest}} J^T
-$$
-
-$$
-\alpha' = 1 - (1 - \alpha)^{1 / \max(\det(J), 10^{-6})}
-$$
-
-### 4. Higham Polar Decomposition for SH Rotation
-
-To rotate viewing direction without mutating 48 SH spherical harmonics coefficients, the deformation Jacobian $J$ is decomposed into $J = R P$ where $R \in \mathrm{SO}(3)$ using scaled Newton-Schulz iterations:
-
-$$
-R_0 = J, \quad R_{k+1} = \frac{1}{2} \left( \gamma_k R_k + \frac{1}{\gamma_k} R_k^{-T} \right)
-$$
-
-Enforcing proper chirality $\det(R) = +1$, the view direction is evaluated in local reference coordinates:
-
-$$
-\mathbf{d}_{\text{local}} = R^T \left( \frac{\mathbf{p}' - \mathbf{c}_{\text{cam}}}{\|\mathbf{p}' - \mathbf{c}_{\text{cam}}\|} \right)
-$$
-
-### 5. Damped Spring Cage Dynamics
-
-Cage elasticity update per unpinned vertex $k$:
-
-$$
-\Delta t_{\text{sim}} = \min(\Delta t, 0.033)
-$$
-
-$$
-\begin{aligned}
-\mathbf{a}_k &= \frac{k_{\text{stiffness}}}{m} (\mathbf{X}_{\text{rest}, k} - \mathbf{x}_k) \\
-\mathbf{v}_k^{t+1} &= \gamma \cdot (\mathbf{v}_k^t + \mathbf{a}_k \Delta t_{\text{sim}}) \\
-\mathbf{x}_k^{t+1} &= \mathbf{x}_k^t + \mathbf{v}_k^{t+1} \Delta t_{\text{sim}}
-\end{aligned}
-$$
-
-Baseline parameters: Stiffness $k = 180.0\text{ N/m}$, damping $\gamma = 0.92$, mass $m = 1.0\text{ kg}$.
-
----
-
-## Benchmark Latency Table
-
-*Empirically measured on hardware: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM / Vulkan / CubeCL) at 1920 × 1080 resolution with 100,000 Gaussians.*
-
-| Stage | CPU Reference Mode (Multi-Threaded) | CubeCL GPU Native Mode (RTX 3050 Laptop) |
-| :--- | :---: | :---: |
-| **Stage 1: Cage Deformation** | 9.90 ms | 0.52 ms |
-| **Stage 2: EWA 3D-to-2D Projection** | 0.92 ms | 0.26 ms |
-| **Stage 3: Tile Binning & Sort** | 57.02 ms | 2.95 ms |
-| **Stage 4: Tile Compositor** | 267.93 ms | **5.78 ms** |
-| **Stage 5: Fullscreen Blit & Overlays** | 0.28 ms | 0.30 ms |
-| **Total Frame Latency** | **336.05 ms** | **9.81 ms** |
-| **Effective Framerate** | **3.0 FPS** | **101.9 FPS** |
-
-> *"The CPU Reference backend serves as a deterministic mathematical ground truth for headless CI and platforms without WebGPU/Vulkan compute support. The CubeCL GPU backend executes entirely in hardware with zero CPU readbacks, maintaining sustained real-time performance."*
-
----
-
-## Quickstart & Build Instructions
-
-### Prerequisites
-- **Rust Toolchain:** Stable 1.80+ or Nightly (Edition 2024 compatible)
-- **Vulkan / Metal / DirectX 12 GPU Drivers**
-
-### 1. Build and Run Test Suite
 ```bash
-# Verify Clippy with zero warnings
+# Test suite
+cargo test --all-targets
+
+# Zero-warning lint gate
 cargo clippy --all-targets -- -D warnings
 
-# Execute full unit and integration test suite
-cargo test --all-targets --release
-```
-
-### 2. Launch with Procedural Synthetic Cluster
-```bash
+# Interactive viewport with the procedural scene
 cargo run --release
-```
 
-### 3. Ingest a Binary PLY Capture
-```bash
-cargo run --release -- path/to/capture.ply
-```
+# Interactive viewport with a capture
+cargo run --release -- path/to/scene.ply
 
-### 4. Run Benchmark Suite
-```bash
+# Benchmark suite
 cargo run --release --bin benchmark
-```
 
-### 5. Autonomous Headless Demo Recording
-```bash
+# Criterion stage benchmarks
+cargo bench --bench stages
+
+# Headless render farm
+cargo run --release --bin render -- \
+    --input scene.ply --camera-path camera.json --out frames/
+
+# Headless demo recorder (PNG frames, plus MP4/GIF when ffmpeg is on PATH)
 cargo run --release --bin record_demo
 ```
-Programmatically executes the 120-frame trajectory (360° orbit, top handle deformation, and damped spring release) and encodes production media (`docs/cindergs_demo.mp4` and `docs/cindergs_demo.gif`).
 
----
+### Camera path JSON
 
-## Viewport Controls & HUD Guide
+```json
+{
+  "width": 960,
+  "height": 540,
+  "fps": 30,
+  "frames": 120,
+  "keyframes": [
+    { "time": 0.0, "eye": [0.0, 0.5, -4.0], "target": [0.0, 0.0, 0.0] },
+    { "time": 4.0, "eye": [0.0, 0.5, 4.0],  "target": [0.0, 0.0, 0.0],
+      "fov_y_degrees": 50.0 }
+  ]
+}
+```
+
+Keyframes are interpolated linearly; yaw takes the shortest path. Without
+`--camera-path`, the renderer generates a one-revolution orbit around the
+auto-framed subject.
+
+## PLY schema support
+
+The loader parses the ASCII header and supports:
+
+- `format binary_little_endian` and `format binary_big_endian`
+- `float` and `double` scalar properties
+- arbitrary property order and ignored extra properties
+- required properties `x y z f_dc_0..2 opacity scale_0..2 rot_0..3`
+- optional `f_rest_*` with exactly 0, 3, 8 or 45 entries → SH degree 0–3
+- a zero-copy `mmap` path for the canonical 62-float little-endian layout
+
+Unsupported inputs (ASCII, list properties, truncated payloads, unknown formats,
+invalid SH layouts) return descriptive `PlyError` variants.
+
+## Automatic framing
+
+`scene::autoframe` samples up to 200,000 positions, takes the 2nd and 98th
+percentile of every axis to reject distant outliers, and derives the hero cage
+and orbit distance from the trimmed box. A specific capture can be framed
+explicitly from the CLI with `--look-at`, `--distance` and `--bounds`, which is
+useful for room-scale captures where the subject is much smaller than the scene.
+
+## Deformation and dynamics
+
+- Positions: `x' = Σ wₖ Xₖ` using barycentric weights from the owning tet.
+- Covariances: `Σ' = J Σ Jᵀ`, symmetrized and regularized to at least `1e-4` on
+  the diagonal.
+- Opacity: `α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))`.
+- SH rotation: coefficients are rotated by the polar rotation `R` with exact
+  monomial rotation matrices for degrees 1–3
+  (`render/rasterizer/sh_rotation.rs`). Matrices are built once per tetrahedron
+  and reused for every Gaussian bound to it.
+- Springs: semi-implicit Euler with exponential damping
+  `γ = exp(−c Δt)`, `c = −ln(γ₆₀)·60`, so trajectories are frame-rate
+  independent. Timesteps are clamped to 33 ms.
+- Cages are independent: each owns its mesh, bindings, stiffness, damping, mass
+  and colour. Overlaps resolve first-cage-wins.
+
+## Viewport controls
 
 | Input | Action |
 | :--- | :--- |
-| **Right Mouse Button (RMB) + Drag** | Spherical orbit around pivot target |
-| **Middle Mouse Button (MMB) + Drag** | Camera sensor-plane panning |
-| **Scroll Wheel** | Proportional distance zooming |
-| **Left Mouse Button (LMB) on Handle** | Pick and drag volumetric cage vertex |
-| **LMB Release** | Release pinned vertex to activate spring oscillation |
+| Right mouse drag | Orbit |
+| Middle mouse drag | Pan |
+| Scroll | Zoom |
+| Left click on a handle | Select a cage vertex |
+| Left drag | Move the selected vertex |
+| Release | Let the spring settle |
 
-### Immediate-Mode HUD Controls (egui)
-- **Execution Backend:** Switch between `CPU Reference` (deterministic validation) and `CubeCL GPU` (hardware compute dispatch).
-- **Show Cage Wireframe:** Toggle translucent cyan tetrahedral edges and glowing gold vertex pick handles.
-- **Spring Stiffness (10 – 500 N/m):** Adjust cage elasticity restorative force.
-- **Spring Damping (0.50 – 0.99):** Control oscillation settling rate.
-- **Trigger Jiggle Impulse:** Perturb all unpinned cage vertices radially outward with an explosive velocity pulse.
-- **Reset Cage / Reset Camera:** Restore rest lattice topology or orbit view.
+The HUD controls the execution backend, SH degree, wireframe visibility,
+per-cage stiffness and damping, jiggle/reset, add/remove cage, and timeline
+bake/play/scrub.
 
----
+## Repository layout
+
+```
+src/math/         activations, covariance construction, EWA conic math
+src/scene/        PLY schema parser, SoA storage, auto-framing, synthetic scenes
+src/deformation/  tet cages, SH rotation, polar decomposition, springs, CPU deformation
+src/render/       unified WGPU/CubeCL device, kernels, binning, compositor, blit
+src/app/          winit event loop, egui HUD, orbit camera, picker, timeline
+src/bin/          benchmark, headless render farm, demo recorder
+tests/            integration, kernel parity, golden image
+benches/          Criterion per-stage CPU benchmarks
+web/              browser PLY drop-zone (wasm-bindgen)
+```
+
+`memmap2` and `rayon` are compiled for non-`wasm32` targets; the parallel helpers
+fall back to sequential iteration on WebAssembly.
+
+## Demo media
+
+`docs/cindergs_demo.gif` and `docs/cindergs_demo.mp4` are recorded from the
+Mip-NeRF 360 bonsai capture (1,073,930 Gaussians) with:
+
+```bash
+cargo run --release --bin record_demo -- \
+    --input assets/bonsai.ply \
+    --look-at 0.38,0.88,1.35 --distance 3.2 \
+    --bounds -0.15,0.43,0.50,1.15,1.10,2.00
+```
+
+The cage encloses only the canopy. Its base ring is pinned, so displacement
+tapers to zero at the foliage/trunk junction: the flowers ruffle while the
+trunk, pot and table stay anchored.
+
+`assets/bonsai.ply` is not committed (`*.ply` is ignored) because of its size and
+the GraphDeco research license. Without the file the recorder renders a synthetic
+scene. Encoding uses `ffmpeg`; without it the PNG frames remain in
+`target/demo_frames/`.
+
+Large media is tracked through Git LFS patterns in `.gitattributes`. To store the
+blobs already in history with LFS, run
+`git lfs migrate import --include="docs/*.gif,docs/*.mp4"`.
+
+## Architecture notes
+
+- Stage 3 (tile binning and sorting) runs on the CPU.
+- GPU deformation updates geometry only; SH rotation is applied by the CPU
+  deformation path.
+- The composited frame is read back once per frame to upload the sRGB offscreen
+  texture. CubeCL exposes storage handles rather than textures, so the blit
+  source is a texture upload.
+- The WebAssembly target covers PLY ingestion and validation; the interactive
+  viewport is native.
+- The renderer is a forward splat compositor with no shadow or ray-traced paths.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
+MIT — see [LICENSE](LICENSE).
