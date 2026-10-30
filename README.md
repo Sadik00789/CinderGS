@@ -339,8 +339,8 @@ CinderGS/
 ## 📚 References & Acknowledgments
 
 - **3D Gaussian Splatting**: Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler, George Drettakis. *3D Gaussian Splatting for Real-Time Radiance Field Rendering*. ACM Transactions on Graphics (SIGGRAPH 2023).
-- **CubeCL Project**: High-performance, multi-backend compute kernel framework in pure Rust ([cubecl.org](https://cubecl.org/)).
-- **WGPU Ecosystem**: Portable graphics standard implementation in Rust ([wgpu.rs](https://wgpu.rs/)).
+- **CubeCL Project**: High-performance, multi-backend compute kernel framework in pure Rust.
+- **WGPU Ecosystem**: Portable graphics standard implementation in Rust.
 
 ---
 
