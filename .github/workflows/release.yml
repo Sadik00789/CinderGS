@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Release Archive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libudev-dev libvulkan-dev
+
+      - name: Setup DXC for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10" -Recurse -Filter "dxcompiler.dll" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if ($dxc) {
+            $dxcDir = $dxc.DirectoryName
+            Write-Host "Found DXC in Windows Kits: $dxcDir"
+            echo "$dxcDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Host "Downloading DXC release fallback..."
+            $dxcDir = "$env:TEMP\dxc"
+            New-Item -ItemType Directory -Force -Path $dxcDir | Out-Null
+            $url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2502/dxc_2025_02_28.zip"
+            Invoke-WebRequest -Uri $url -OutFile "$dxcDir\dxc.zip"
+            Expand-Archive -Path "$dxcDir\dxc.zip" -DestinationPath $dxcDir -Force
+            echo "$dxcDir\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          echo "WGPU_DX12_COMPILER=dxc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          TARGET=$(rustc -vV | sed -n 's/^host: //p')
+          STAGE="cinder_gs-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir -p "dist/${STAGE}"
+          cp target/release/cinder_gs target/release/render target/release/record_demo target/release/benchmark "dist/${STAGE}/"
+          cp README.md LICENSE CHANGELOG.md "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          rm -rf "dist/${STAGE}"
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = (rustc -vV | Select-String '^host: ').ToString().Split(' ')[1].Trim()
+          $stage = "cinder_gs-$($env:GITHUB_REF_NAME)-$target"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item target/release/cinder_gs.exe, target/release/render.exe, target/release/record_demo.exe, target/release/benchmark.exe "dist/$stage/"
+          Copy-Item README.md, LICENSE, CHANGELOG.md "dist/$stage/"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
+          Remove-Item -Recurse -Force "dist/$stage"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive-${{ matrix.os }}
+          path: dist/*
+
+  publish:
+    name: Publish Release Assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: |
+          sha256sum cinder_gs-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Ensure release exists and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "CinderGS $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber

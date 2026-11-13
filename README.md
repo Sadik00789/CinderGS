@@ -5,6 +5,7 @@
 **High-Performance 3D Gaussian Splatting & Volumetric Cage Kinematics in Pure Rust**
 
 [![CI](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml/badge.svg)](https://github.com/Sadik00789/CinderGS/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Sadik00789/CinderGS?style=flat-square)](https://github.com/Sadik00789/CinderGS/releases)
 [![Rust Edition 2024](https://img.shields.io/badge/Rust_Edition-2024-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85+-blue.svg?style=flat-square&logo=rust)](Cargo.toml)
 [![WGPU 30](https://img.shields.io/badge/WGPU-v30.0-blue.svg?style=flat-square&logo=webgpu)](https://wgpu.rs/)
@@ -331,6 +332,7 @@ CinderGS/
 ├── web/
 │   └── index.html          # Browser drag-and-drop PLY inspector
 ├── Cargo.toml              # Rust dependency definitions and profiles
+├── CHANGELOG.md            # Version history and release notes
 └── LICENSE                 # MIT License
 ```
 

@@ -1,11 +1,17 @@
 [package]
 name = "cinder_gs"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["CinderGS Engine Team"]
 license = "MIT"
 description = "High-performance production-grade 3D Gaussian Splatting engine core"
+repository = "https://github.com/Sadik00789/CinderGS"
+homepage = "https://github.com/Sadik00789/CinderGS"
+readme = "README.md"
+keywords = ["gaussian-splatting", "3dgs", "wgpu", "cubecl", "rendering"]
+categories = ["graphics", "rendering", "simulation"]
+exclude = ["docs/*", "assets/*"]
 
 [dependencies]
 glam = "0.28"
