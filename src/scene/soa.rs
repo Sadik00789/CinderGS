@@ -339,8 +339,8 @@ mod tests {
             v.scale = [-1.0 + (fi % 3.0), -2.0, 0.5];
             v.rot = [1.0, (fi % 4.0) * 0.1, 0.0, 0.0];
             v.f_dc = [fi * 0.01, fi * 0.02, fi * 0.03];
-            for j in 0..45 {
-                v.f_rest[j] = (fi + j as f32) * 0.001;
+            for (j, slot) in v.f_rest.iter_mut().enumerate() {
+                *slot = (fi + j as f32) * 0.001;
             }
             raw_data.push(v);
         }
