@@ -3,13 +3,15 @@ use crate::render::blit::{BlitPipeline, OFFSCREEN_FORMAT};
 use crate::render::camera::CameraUniforms;
 use crate::render::gpu::{GpuCompute, GpuError};
 use crate::render::gpu_bridge::{
-    DeformedGeometry, composite_gpu, deform_geometry_gpu, project_gaussians_gpu,
+    DeformedGeometry, composite_gpu, deform_geometry_gpu, deform_geometry_with_splitting_gpu,
+    project_gaussians_cull_gpu, project_gaussians_gpu,
 };
 use crate::render::gpu_pool::GpuBufferPool;
-use crate::render::project_scene_cpu;
+use crate::render::rasterizer::sh_rotation::ShRotator;
 use crate::render::rasterizer::{CompositorUniforms, RasterizedImage, rasterize_scene_cpu};
 use crate::render::tiles::TileBinningOutputs;
 use crate::render::wireframe::{CageGuide, WireframeRenderer};
+use crate::render::{project_scene_cpu, project_scene_cull_cpu};
 use crate::scene::GaussianSceneSoa;
 
 /// Execution backend selector between the CPU reference and native CubeCL GPU kernels.
@@ -72,6 +74,11 @@ pub struct SortCache {
     cage_state: Vec<[f32; 3]>,
     width: u32,
     height: u32,
+    splat_count: usize,
+    focal_x_bits: u32,
+    focal_y_bits: u32,
+    split_threshold_bits: u32,
+    mip_var_bits: u32,
     binning: Option<TileBinningOutputs>,
     /// Number of frames served from this cache.
     pub reuse_count: u64,
@@ -113,6 +120,34 @@ impl SortCache {
         }
     }
 
+    /// Extended cache check also tracking scene count, focal lengths, and adaptive parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_if_reusable_for_frame(
+        &mut self,
+        view_matrix: &[f32; 16],
+        cage_state: &[[f32; 3]],
+        width: u32,
+        height: u32,
+        splat_count: usize,
+        focal_x: f32,
+        focal_y: f32,
+        split_threshold: f32,
+        mip_var: f32,
+    ) -> Option<TileBinningOutputs> {
+        let params_match = self.splat_count == splat_count
+            && self.focal_x_bits == focal_x.to_bits()
+            && self.focal_y_bits == focal_y.to_bits()
+            && self.split_threshold_bits == split_threshold.to_bits()
+            && self.mip_var_bits == mip_var.to_bits();
+        if params_match && self.can_reuse(view_matrix, cage_state, width, height) {
+            self.reuse_count += 1;
+            self.binning.take()
+        } else {
+            self.binning = None;
+            None
+        }
+    }
+
     /// Stores the binning computed for this frame.
     pub fn commit(
         &mut self,
@@ -129,11 +164,35 @@ impl SortCache {
         self.binning = Some(binning);
     }
 
+    /// Stores the binning along with extended frame key metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_for_frame(
+        &mut self,
+        view_matrix: &[f32; 16],
+        cage_state: &[[f32; 3]],
+        width: u32,
+        height: u32,
+        splat_count: usize,
+        focal_x: f32,
+        focal_y: f32,
+        split_threshold: f32,
+        mip_var: f32,
+        binning: TileBinningOutputs,
+    ) {
+        self.splat_count = splat_count;
+        self.focal_x_bits = focal_x.to_bits();
+        self.focal_y_bits = focal_y.to_bits();
+        self.split_threshold_bits = split_threshold.to_bits();
+        self.mip_var_bits = mip_var.to_bits();
+        self.commit(view_matrix, cage_state, width, height, binning);
+    }
+
     /// Drops the cached binning (e.g. on resize or scene replacement).
     pub fn invalidate(&mut self) {
         self.binning = None;
         self.view_matrix = None;
         self.cage_state.clear();
+        self.splat_count = 0;
     }
 }
 
@@ -157,6 +216,10 @@ pub struct RenderPipelineOrchestrator {
     pub last_backend_error: Option<String>,
     pub sort_cache: SortCache,
     pub frames_rendered: u64,
+    /// Transient strain-driven Gaussian split threshold (`0.0` disables splitting).
+    pub strain_split_threshold: f32,
+    /// 3D Mip-Splatting isotropic filter variance (`0.0` disables 3D mip filter).
+    pub mip_filter_3d_var: f32,
 }
 
 impl RenderPipelineOrchestrator {
@@ -181,7 +244,23 @@ impl RenderPipelineOrchestrator {
             last_backend_error: None,
             sort_cache: SortCache::default(),
             frames_rendered: 0,
+            strain_split_threshold: 0.0,
+            mip_filter_3d_var: 0.0,
         }
+    }
+
+    /// Sets the transient stretch threshold for adaptive Gaussian splitting (`<= 0.0` disables).
+    #[inline]
+    pub fn set_strain_split_threshold(&mut self, threshold: f32) {
+        self.strain_split_threshold = threshold.max(0.0);
+        self.sort_cache.invalidate();
+    }
+
+    /// Sets the 3D Mip-Splatting isotropic regularization variance (`<= 0.0` disables).
+    #[inline]
+    pub fn set_mip_filter_3d_var(&mut self, var: f32) {
+        self.mip_filter_3d_var = var.max(0.0);
+        self.sort_cache.invalidate();
     }
 
     /// Registers the presentation `wgpu` device with CubeCL so one device serves both.
@@ -304,6 +383,40 @@ impl RenderPipelineOrchestrator {
         usize,
         Option<TileBinningOutputs>,
     ) {
+        Self::execute_cpu_reference_with_options(
+            scene,
+            cages,
+            camera,
+            compositor,
+            width,
+            height,
+            previous_binning,
+            0.0,
+            0.0,
+        )
+    }
+
+    /// CPU reference execution path supporting optional transient strain-driven
+    /// splitting and 3D/2D Mip-Splatting anti-aliasing with active-only binning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_cpu_reference_with_options(
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+        width: u32,
+        height: u32,
+        previous_binning: Option<&TileBinningOutputs>,
+        strain_split_threshold: f32,
+        mip_filter_3d_var: f32,
+    ) -> (
+        RasterizedImage,
+        usize,
+        usize,
+        usize,
+        Option<TileBinningOutputs>,
+    ) {
+        let has_cages = cages.is_some_and(|c| !c.is_empty());
         let deformed_scene: std::borrow::Cow<'_, GaussianSceneSoa> = match cages {
             Some(cage_scene) if !cage_scene.is_empty() => {
                 let num_tets: usize = cage_scene.cages.iter().map(|c| c.mesh.num_tets()).sum();
@@ -312,18 +425,41 @@ impl RenderPipelineOrchestrator {
                     compositor.sh_degree,
                     scene.count as u32,
                     num_tets as u32,
-                );
+                )
+                .with_strain_splitting(strain_split_threshold)
+                .with_mip_filter_3d(mip_filter_3d_var);
                 std::borrow::Cow::Owned(deform_cage_scene_cpu(scene, cage_scene, &uniforms).scene)
             }
             _ => std::borrow::Cow::Borrowed(scene),
         };
 
-        let proj = project_scene_cpu(&deformed_scene, camera);
+        let use_cull_projection = strain_split_threshold > 0.0 || mip_filter_3d_var > 0.0;
+        let (proj, effective_opacities): (
+            crate::render::ProjectionOutputs,
+            std::borrow::Cow<'_, [f32]>,
+        ) = if use_cull_projection {
+            let options = crate::math::ProjectionOptions {
+                mip_filter_3d_var: if has_cages { 0.0 } else { mip_filter_3d_var },
+                ..Default::default()
+            };
+            let culled = project_scene_cull_cpu(&deformed_scene, camera, &options);
+            (culled.projection, std::borrow::Cow::Owned(culled.opacities))
+        } else {
+            (
+                project_scene_cpu(&deformed_scene, camera),
+                std::borrow::Cow::Borrowed(deformed_scene.opacities.as_slice()),
+            )
+        };
+
         let culled_count = proj.count.saturating_sub(proj.num_surviving());
         let rendered_count = proj.num_surviving();
 
         let computed = if previous_binning.is_none() {
-            Some(proj.bin_and_sort(width, height))
+            if use_cull_projection {
+                Some(proj.bin_and_sort_active(width, height))
+            } else {
+                Some(proj.bin_and_sort(width, height))
+            }
         } else {
             None
         };
@@ -341,7 +477,7 @@ impl RenderPipelineOrchestrator {
         let img = rasterize_scene_cpu(
             &proj.points_xy,
             &proj.conics,
-            &deformed_scene.opacities,
+            &effective_opacities,
             &deformed_scene.sh_coeffs,
             &deformed_scene.positions,
             &binning.sorted_entries,
@@ -350,6 +486,69 @@ impl RenderPipelineOrchestrator {
         );
 
         (img, culled_count, rendered_count, active_tiles, computed)
+    }
+
+    fn prepare_gpu_sh_coeffs<'a>(
+        scene: &'a GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        sh_degree: u32,
+        split_sources: &[u32],
+    ) -> std::borrow::Cow<'a, [f32]> {
+        let Some(cage_scene) = cages.filter(|c| !c.is_empty()) else {
+            return std::borrow::Cow::Borrowed(&scene.sh_coeffs);
+        };
+        let deg = sh_degree.min(3);
+        if deg == 0 && split_sources.is_empty() {
+            return std::borrow::Cow::Borrowed(&scene.sh_coeffs);
+        }
+
+        let mut rotated = scene.sh_coeffs.clone();
+        if deg > 0 {
+            let deformed = cage_scene.deformed_vertices();
+            let rotators: Vec<Vec<ShRotator>> = cage_scene
+                .cages
+                .iter()
+                .zip(deformed.iter())
+                .map(|(cage, verts)| {
+                    let (_, rots) =
+                        crate::deformation::compute_tet_transforms_cpu(&cage.mesh, verts);
+                    rots.into_iter().map(|r| ShRotator::new(r, deg)).collect()
+                })
+                .collect();
+
+            for (i, binding) in cage_scene.bindings.iter().enumerate() {
+                if !binding.is_bound() {
+                    continue;
+                }
+                if let Some(rotator) = rotators
+                    .get(binding.cage as usize)
+                    .and_then(|tets| tets.get(binding.tet as usize))
+                {
+                    let base = i * 48;
+                    if let Ok(coeffs) = rotated
+                        .get_mut(base..base + 48)
+                        .ok_or(())
+                        .and_then(|s| <&mut [f32; 48]>::try_from(s).map_err(|_| ()))
+                    {
+                        rotator.apply(coeffs);
+                    }
+                }
+            }
+        }
+
+        if !split_sources.is_empty() {
+            rotated.reserve(split_sources.len() * 48);
+            for &src in split_sources {
+                let base = (src as usize) * 48;
+                if base + 48 <= rotated.len() {
+                    rotated.extend_from_within(base..base + 48);
+                } else {
+                    rotated.extend(std::iter::repeat_n(0.0, 48));
+                }
+            }
+        }
+
+        std::borrow::Cow::Owned(rotated)
     }
 
     /// Executes the native CubeCL GPU path.
@@ -365,6 +564,8 @@ impl RenderPipelineOrchestrator {
         camera: &CameraUniforms,
         compositor: &CompositorUniforms,
         previous_binning: Option<&TileBinningOutputs>,
+        strain_split_threshold: f32,
+        mip_filter_3d_var: f32,
     ) -> Result<
         (
             RasterizedImage,
@@ -392,6 +593,9 @@ impl RenderPipelineOrchestrator {
         }
 
         let mut geometry: Option<DeformedGeometry> = None;
+        let mut cumulative_split_sources: Vec<u32> = Vec::new();
+        let use_adaptive_or_cull = strain_split_threshold > 0.0 || mip_filter_3d_var > 0.0;
+        let mut has_cages = false;
 
         if let Some(cage_scene) = cages.filter(|c| !c.is_empty()) {
             let deformed = cage_scene.deformed_vertices();
@@ -399,8 +603,10 @@ impl RenderPipelineOrchestrator {
                 if cage.mesh.num_tets() == 0 {
                     continue;
                 }
+                has_cages = true;
 
-                let bindings: Vec<GaussianBinding> = cage_scene
+                let current_count = geometry.as_ref().map_or(count, |g| g.opacities.len());
+                let mut bindings: Vec<GaussianBinding> = cage_scene
                     .bindings
                     .iter()
                     .map(|binding| {
@@ -411,6 +617,9 @@ impl RenderPipelineOrchestrator {
                         }
                     })
                     .collect();
+                if bindings.len() < current_count {
+                    bindings.resize(current_count, GaussianBinding::unbound());
+                }
 
                 let (positions, covariances, opacities) = match geometry.as_ref() {
                     Some(previous) => (
@@ -425,19 +634,48 @@ impl RenderPipelineOrchestrator {
                     ),
                 };
 
-                geometry = Some(deform_geometry_gpu(
-                    client,
-                    positions,
-                    covariances,
-                    opacities,
-                    &cage.mesh,
-                    &bindings,
-                    &deformed[cage_index],
-                )?);
+                let next_geom = if use_adaptive_or_cull {
+                    deform_geometry_with_splitting_gpu(
+                        client,
+                        positions,
+                        covariances,
+                        opacities,
+                        &cage.mesh,
+                        &bindings,
+                        &deformed[cage_index],
+                        strain_split_threshold,
+                        mip_filter_3d_var,
+                    )?
+                } else {
+                    deform_geometry_gpu(
+                        client,
+                        positions,
+                        covariances,
+                        opacities,
+                        &cage.mesh,
+                        &bindings,
+                        &deformed[cage_index],
+                    )?
+                };
+                if !next_geom.split_source_indices.is_empty() {
+                    for &src in &next_geom.split_source_indices {
+                        let mapped = if (src as usize) < count {
+                            src
+                        } else {
+                            let child_offset = (src as usize) - count;
+                            cumulative_split_sources
+                                .get(child_offset)
+                                .copied()
+                                .unwrap_or(src)
+                        };
+                        cumulative_split_sources.push(mapped);
+                    }
+                }
+                geometry = Some(next_geom);
             }
         }
 
-        let (positions, covariances, opacities) = match geometry.as_ref() {
+        let (positions, covariances, raw_opacities) = match geometry.as_ref() {
             Some(deformed) => (
                 deformed.positions.as_slice(),
                 deformed.covariances.as_slice(),
@@ -450,12 +688,40 @@ impl RenderPipelineOrchestrator {
             ),
         };
 
-        let projection = project_gaussians_gpu(client, positions, covariances, camera)?;
+        let (projection, opacities): (
+            crate::render::ProjectionOutputs,
+            std::borrow::Cow<'_, [f32]>,
+        ) = if use_adaptive_or_cull {
+            let culled = project_gaussians_cull_gpu(
+                client,
+                positions,
+                covariances,
+                raw_opacities,
+                camera,
+                if has_cages { 0.0 } else { mip_filter_3d_var },
+                crate::math::MIN_CULL_OPACITY,
+                crate::math::MIN_EFFECTIVE_RADIUS_PX,
+            )?;
+            (culled.projection, std::borrow::Cow::Owned(culled.opacities))
+        } else {
+            (
+                project_gaussians_gpu(client, positions, covariances, camera)?,
+                std::borrow::Cow::Borrowed(raw_opacities),
+            )
+        };
+
         let culled_count = projection.count.saturating_sub(projection.num_surviving());
         let rendered_count = projection.num_surviving();
 
         let computed = if previous_binning.is_none() {
-            Some(projection.bin_and_sort(compositor.screen_width, compositor.screen_height))
+            if use_adaptive_or_cull {
+                Some(
+                    projection
+                        .bin_and_sort_active(compositor.screen_width, compositor.screen_height),
+                )
+            } else {
+                Some(projection.bin_and_sort(compositor.screen_width, compositor.screen_height))
+            }
         } else {
             None
         };
@@ -473,12 +739,18 @@ impl RenderPipelineOrchestrator {
             ));
         };
         let active_tiles = binning.non_empty_tiles_count();
+        let sh_coeffs = Self::prepare_gpu_sh_coeffs(
+            scene,
+            cages,
+            compositor.sh_degree,
+            &cumulative_split_sources,
+        );
 
         let image = composite_gpu(
             client,
             &projection,
-            opacities,
-            &scene.sh_coeffs,
+            &opacities,
+            &sh_coeffs,
             positions,
             binning,
             compositor,
@@ -519,10 +791,20 @@ impl RenderPipelineOrchestrator {
 
         let deformed_vertices = cages.map(CageScene::deformed_vertices).unwrap_or_default();
         let cage_state = Self::cage_state(cages, &deformed_vertices);
+        let split_threshold = self.strain_split_threshold;
+        let mip_var = self.mip_filter_3d_var;
 
-        let reused_binning =
-            self.sort_cache
-                .take_if_reusable(&camera.view_matrix, &cage_state, width, height);
+        let reused_binning = self.sort_cache.take_if_reusable_for_frame(
+            &camera.view_matrix,
+            &cage_state,
+            width,
+            height,
+            scene.count,
+            camera.focal_x,
+            camera.focal_y,
+            split_threshold,
+            mip_var,
+        );
         let previous_ref = reused_binning.as_ref();
         let was_reused = previous_ref.is_some();
 
@@ -534,9 +816,16 @@ impl RenderPipelineOrchestrator {
                     let _ = self.compute();
                 }
                 let gpu_result = match self.gpu.as_ref() {
-                    Some(gpu) => {
-                        Self::execute_gpu(gpu, scene, cages, &camera, &compositor, previous_ref)
-                    }
+                    Some(gpu) => Self::execute_gpu(
+                        gpu,
+                        scene,
+                        cages,
+                        &camera,
+                        &compositor,
+                        previous_ref,
+                        split_threshold,
+                        mip_var,
+                    ),
                     None => {
                         let message = self
                             .gpu_error
@@ -550,7 +839,7 @@ impl RenderPipelineOrchestrator {
                     Ok(result) => result,
                     Err(err) => {
                         backend_error = Some(err.to_string());
-                        Self::execute_cpu_reference(
+                        Self::execute_cpu_reference_with_options(
                             scene,
                             cages,
                             &camera,
@@ -558,11 +847,13 @@ impl RenderPipelineOrchestrator {
                             width,
                             height,
                             None,
+                            split_threshold,
+                            mip_var,
                         )
                     }
                 }
             }
-            ExecutionBackend::CpuReference => Self::execute_cpu_reference(
+            ExecutionBackend::CpuReference => Self::execute_cpu_reference_with_options(
                 scene,
                 cages,
                 &camera,
@@ -570,14 +861,26 @@ impl RenderPipelineOrchestrator {
                 width,
                 height,
                 previous_ref,
+                split_threshold,
+                mip_var,
             ),
         };
 
         let sort_reused = was_reused && computed_binning.is_none();
         let final_binning = computed_binning.or(reused_binning);
         if let Some(binning) = final_binning {
-            self.sort_cache
-                .commit(&camera.view_matrix, &cage_state, width, height, binning);
+            self.sort_cache.commit_for_frame(
+                &camera.view_matrix,
+                &cage_state,
+                width,
+                height,
+                scene.count,
+                camera.focal_x,
+                camera.focal_y,
+                split_threshold,
+                mip_var,
+                binning,
+            );
         }
 
         self.last_backend_error = backend_error;

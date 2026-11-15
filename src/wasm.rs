@@ -27,3 +27,20 @@ pub fn describe_ply(bytes: &[u8]) -> Result<String, JsValue> {
         framing.camera_distance
     ))
 }
+
+/// Parses a PLY buffer and reports quantized VRAM memory footprint (`f16` covariances/SH
+/// plus octahedral-encoded rotations) relative to full `f32` SoA storage.
+#[wasm_bindgen]
+pub fn describe_ply_quantized(bytes: &[u8], sh_degree: u32) -> Result<String, JsValue> {
+    let scene = crate::scene::PlyLoader::load_from_bytes(bytes)
+        .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let quantized = scene.quantize_with_degree(sh_degree);
+    Ok(format!(
+        "{} Gaussians | f32: {} bytes -> quantized (SH{}): {} bytes ({:.2}x smaller)",
+        scene.len(),
+        quantized.unquantized_bytes(),
+        quantized.sh_degree,
+        quantized.total_bytes(),
+        quantized.compression_ratio()
+    ))
+}

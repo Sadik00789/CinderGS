@@ -288,6 +288,360 @@ impl GaussianSceneSoa {
             + self.opacities_bytes().len()
             + self.sh_coeffs_bytes().len()
     }
+
+    /// Quantizes covariances and SH coefficients into compact `f16` + octahedral rotation storage.
+    #[inline]
+    pub fn quantize(&self) -> QuantizedGaussianSceneSoa {
+        QuantizedGaussianSceneSoa::from_soa(self)
+    }
+
+    /// Quantizes the scene keeping SH coefficients up to `sh_degree` (`0..=3`).
+    #[inline]
+    pub fn quantize_with_degree(&self, sh_degree: u32) -> QuantizedGaussianSceneSoa {
+        QuantizedGaussianSceneSoa::from_soa_with_degree(self, sh_degree)
+    }
+
+    /// Reconstructs uncompressed `RawPlyVertex` records (pre-activation log-scale and logit-opacity)
+    /// suitable for serializing deformed scenes back to standard binary `.ply` files.
+    pub fn to_raw_vertices(&self) -> Vec<RawPlyVertex> {
+        let mut vertices = Vec::with_capacity(self.count);
+        for i in 0..self.count {
+            let mut v = RawPlyVertex::ZERO;
+            v.position = self.position(i);
+            v.opacity = crate::math::covariance::inverse_activate_opacity(self.opacity(i));
+
+            let cov = self.covariance_3d(i);
+            let (scale, rot) = crate::math::covariance::decompose_covariance_3d(&cov);
+            let log_scale = crate::math::covariance::inverse_activate_scale(scale);
+            v.scale = [log_scale.x, log_scale.y, log_scale.z];
+            // Canonical PLY quaternion order is [w, x, y, z].
+            v.rot = [rot.w, rot.x, rot.y, rot.z];
+
+            let sh = self.sh_coeffs_at(i);
+            v.f_dc = [sh[0], sh[1], sh[2]];
+            v.f_rest.copy_from_slice(&sh[3..48]);
+            vertices.push(v);
+        }
+        vertices
+    }
+}
+
+/// Number of SH scalar bases per color channel for degree `0..=3`.
+#[inline]
+pub const fn sh_bases_for_degree(sh_degree: u32) -> usize {
+    match sh_degree {
+        0 => 1,
+        1 => 4,
+        2 => 9,
+        _ => 16,
+    }
+}
+
+/// Number of packed `u32` words (two `f16` scalars each) per splat for `sh_degree`.
+#[inline]
+pub const fn sh_packed_words_for_degree(sh_degree: u32) -> usize {
+    (sh_bases_for_degree(sh_degree) * 3).div_ceil(2)
+}
+
+/// Packs two `f32` values into a single `u32` (`low = a as f16`, `high = b as f16`).
+#[inline]
+pub fn pack_f16_pair(a: f32, b: f32) -> u32 {
+    let ha = half::f16::from_f32(a).to_bits() as u32;
+    let hb = half::f16::from_f32(b).to_bits() as u32;
+    ha | (hb << 16)
+}
+
+/// Unpacks two `f16` values from a packed `u32` (`[low, high]`).
+#[inline]
+pub fn unpack_f16_pair(packed: u32) -> [f32; 2] {
+    let a = half::f16::from_bits((packed & 0xFFFF) as u16).to_f32();
+    let b = half::f16::from_bits((packed >> 16) as u16).to_f32();
+    [a, b]
+}
+
+#[inline]
+fn sign_not_zero(v: f32) -> f32 {
+    if v >= 0.0 { 1.0 } else { -1.0 }
+}
+
+/// Encodes a unit rotation quaternion into 32 bits via octahedral axis encoding
+/// (11 bits X, 11 bits Y) plus a 10-bit rotation angle in `[0, pi]`.
+pub fn encode_octahedral_rotation(rot: glam::Quat) -> u32 {
+    let mut q = if rot.length_squared() > 1e-12 {
+        rot.normalize()
+    } else {
+        glam::Quat::IDENTITY
+    };
+    if q.w < 0.0 {
+        q = -q;
+    }
+
+    let (axis, angle) = q.to_axis_angle();
+    let dir = if angle <= 1e-6 || axis.length_squared() <= 1e-12 {
+        glam::Vec3::Z
+    } else {
+        axis.normalize()
+    };
+
+    let l1 = dir.x.abs() + dir.y.abs() + dir.z.abs();
+    let mut ox = dir.x / l1.max(1e-8);
+    let mut oy = dir.y / l1.max(1e-8);
+    if dir.z < 0.0 {
+        let folded_x = (1.0 - oy.abs()) * sign_not_zero(ox);
+        let folded_y = (1.0 - ox.abs()) * sign_not_zero(oy);
+        ox = folded_x;
+        oy = folded_y;
+    }
+
+    let ix = (((ox * 0.5 + 0.5).clamp(0.0, 1.0)) * 2047.0).round() as u32;
+    let iy = (((oy * 0.5 + 0.5).clamp(0.0, 1.0)) * 2047.0).round() as u32;
+    let ia = (((angle / std::f32::consts::PI).clamp(0.0, 1.0)) * 1023.0).round() as u32;
+
+    (ix & 0x7FF) | ((iy & 0x7FF) << 11) | ((ia & 0x3FF) << 22)
+}
+
+/// Decodes an octahedral-encoded 32-bit rotation back to a normalized [`glam::Quat`].
+pub fn decode_octahedral_rotation(packed: u32) -> glam::Quat {
+    let ox = ((packed & 0x7FF) as f32 / 2047.0) * 2.0 - 1.0;
+    let oy = (((packed >> 11) & 0x7FF) as f32 / 2047.0) * 2.0 - 1.0;
+    let oz = 1.0 - ox.abs() - oy.abs();
+
+    let (vx, vy) = if oz < 0.0 {
+        (
+            (1.0 - oy.abs()) * sign_not_zero(ox),
+            (1.0 - ox.abs()) * sign_not_zero(oy),
+        )
+    } else {
+        (ox, oy)
+    };
+
+    let axis = glam::Vec3::new(vx, vy, oz)
+        .try_normalize()
+        .unwrap_or(glam::Vec3::Z);
+    let angle = (((packed >> 22) & 0x3FF) as f32 / 1023.0) * std::f32::consts::PI;
+    glam::Quat::from_axis_angle(axis, angle).normalize()
+}
+
+/// Memory-efficient GPU/WebGPU representation packing symmetric 3D covariances
+/// (`3 x u32` `f16` pairs per splat), octahedral unit rotations (`u32`), and
+/// degree-trimmed `f16` spherical harmonic coefficients (`2..=24` `u32` words/splat).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuantizedGaussianSceneSoa {
+    /// World positions `[x, y, z, ...]` (full `f32` precision for spatial stability).
+    pub positions: Vec<f32>,
+    /// Symmetric 3D covariances `[xx, xy, xz, yy, yz, zz]` packed as 3 `u32` (`f16` pairs) per splat.
+    pub covariances_f16_packed: Vec<u32>,
+    /// Principal rotation decomposed from covariance, packed with octahedral encoding (`u32` per splat).
+    pub octahedral_rotations: Vec<u32>,
+    /// Sigmoid-activated opacities `[alpha_0, ...]`.
+    pub opacities: Vec<f32>,
+    /// `f16`-packed SH coefficients `[R_0..B_{B-1}]` (`sh_packed_words_for_degree(sh_degree)` `u32`s/splat).
+    pub sh_coeffs_f16_packed: Vec<u32>,
+    /// Retained spherical harmonic degree (`0..=3`).
+    pub sh_degree: u32,
+    /// Number of Gaussians stored.
+    pub count: usize,
+}
+
+impl QuantizedGaussianSceneSoa {
+    /// Quantizes all SH degrees (`sh_degree = 3`) into `f16` + octahedral rotation storage.
+    #[inline]
+    pub fn from_soa(scene: &GaussianSceneSoa) -> Self {
+        Self::from_soa_with_degree(scene, 3)
+    }
+
+    /// Quantizes `scene`, retaining only SH coefficients up to `sh_degree` (`0..=3`).
+    pub fn from_soa_with_degree(scene: &GaussianSceneSoa, sh_degree: u32) -> Self {
+        let deg = sh_degree.min(3);
+        let bases = sh_bases_for_degree(deg);
+        let sh_words = sh_packed_words_for_degree(deg);
+        let count = scene.count;
+
+        let mut covariances_f16_packed = Vec::with_capacity(count * 3);
+        let mut octahedral_rotations = Vec::with_capacity(count);
+        let mut sh_coeffs_f16_packed = Vec::with_capacity(count * sh_words);
+
+        let mut temp_sh = vec![0.0f32; sh_words * 2];
+
+        for i in 0..count {
+            let cov = scene.covariance_3d(i);
+            covariances_f16_packed.push(pack_f16_pair(cov[0], cov[1]));
+            covariances_f16_packed.push(pack_f16_pair(cov[2], cov[3]));
+            covariances_f16_packed.push(pack_f16_pair(cov[4], cov[5]));
+
+            let (_, rot) = crate::math::covariance::decompose_covariance_3d(&cov);
+            octahedral_rotations.push(encode_octahedral_rotation(rot));
+
+            let sh = scene.sh_coeffs_at(i);
+            let rest_per_ch = bases - 1;
+            temp_sh.fill(0.0);
+            temp_sh[0..3].copy_from_slice(&sh[0..3]);
+            if rest_per_ch > 0 {
+                temp_sh[3..3 + rest_per_ch].copy_from_slice(&sh[3..3 + rest_per_ch]);
+                temp_sh[3 + rest_per_ch..3 + rest_per_ch * 2]
+                    .copy_from_slice(&sh[18..18 + rest_per_ch]);
+                temp_sh[3 + rest_per_ch * 2..3 + rest_per_ch * 3]
+                    .copy_from_slice(&sh[33..33 + rest_per_ch]);
+            }
+            for pair in temp_sh.chunks_exact(2) {
+                sh_coeffs_f16_packed.push(pack_f16_pair(pair[0], pair[1]));
+            }
+        }
+
+        Self {
+            positions: scene.positions.clone(),
+            covariances_f16_packed,
+            octahedral_rotations,
+            opacities: scene.opacities.clone(),
+            sh_coeffs_f16_packed,
+            sh_degree: deg,
+            count,
+        }
+    }
+
+    /// Number of packed `u32` words per splat for `self.sh_degree`.
+    #[inline]
+    pub fn sh_words_per_splat(&self) -> usize {
+        sh_packed_words_for_degree(self.sh_degree)
+    }
+
+    /// Unpacks the symmetric 3D covariance `[xx, xy, xz, yy, yz, zz]` for splat `index`.
+    #[inline]
+    pub fn unpack_covariance_3d(&self, index: usize) -> [f32; 6] {
+        let base = index * 3;
+        let p0 = unpack_f16_pair(self.covariances_f16_packed[base]);
+        let p1 = unpack_f16_pair(self.covariances_f16_packed[base + 1]);
+        let p2 = unpack_f16_pair(self.covariances_f16_packed[base + 2]);
+        [p0[0], p0[1], p1[0], p1[1], p2[0], p2[1]]
+    }
+
+    /// Unpacks the full 48-float channel-major SH buffer for splat `index` (zero-padding higher degrees).
+    pub fn unpack_sh_48(&self, index: usize) -> [f32; 48] {
+        let bases = sh_bases_for_degree(self.sh_degree);
+        let words = self.sh_words_per_splat();
+        let word_base = index * words;
+
+        let mut linear = [0.0f32; 48];
+        for (w_idx, &word) in self.sh_coeffs_f16_packed[word_base..word_base + words]
+            .iter()
+            .enumerate()
+        {
+            let pair = unpack_f16_pair(word);
+            let idx0 = w_idx * 2;
+            if idx0 < bases * 3 {
+                linear[idx0] = pair[0];
+            }
+            if idx0 + 1 < bases * 3 {
+                linear[idx0 + 1] = pair[1];
+            }
+        }
+
+        let rest_per_ch = bases - 1;
+        let mut out = [0.0f32; 48];
+        out[0..3].copy_from_slice(&linear[0..3]);
+        if rest_per_ch > 0 {
+            out[3..3 + rest_per_ch].copy_from_slice(&linear[3..3 + rest_per_ch]);
+            out[18..18 + rest_per_ch]
+                .copy_from_slice(&linear[3 + rest_per_ch..3 + rest_per_ch * 2]);
+            out[33..33 + rest_per_ch]
+                .copy_from_slice(&linear[3 + rest_per_ch * 2..3 + rest_per_ch * 3]);
+        }
+        out
+    }
+
+    /// Dequantizes back into an uncompressed [`GaussianSceneSoa`].
+    pub fn to_soa(&self) -> GaussianSceneSoa {
+        let mut covariances_3d = Vec::with_capacity(self.count * 6);
+        let mut sh_coeffs = Vec::with_capacity(self.count * 48);
+        for i in 0..self.count {
+            covariances_3d.extend_from_slice(&self.unpack_covariance_3d(i));
+            sh_coeffs.extend_from_slice(&self.unpack_sh_48(i));
+        }
+
+        GaussianSceneSoa {
+            positions: self.positions.clone(),
+            covariances_3d,
+            opacities: self.opacities.clone(),
+            sh_coeffs,
+            count: self.count,
+        }
+    }
+
+    /// Packed 3D covariance bytes for GPU upload.
+    #[inline]
+    pub fn covariances_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.covariances_f16_packed)
+    }
+
+    /// Packed SH bytes for GPU upload.
+    #[inline]
+    pub fn sh_coeffs_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.sh_coeffs_f16_packed)
+    }
+
+    /// Total quantized footprint in bytes.
+    #[inline]
+    pub fn total_bytes(&self) -> usize {
+        self.positions.len() * 4
+            + self.covariances_f16_packed.len() * 4
+            + self.octahedral_rotations.len() * 4
+            + self.opacities.len() * 4
+            + self.sh_coeffs_f16_packed.len() * 4
+    }
+
+    /// Equivalent uncompressed [`GaussianSceneSoa`] footprint in bytes.
+    #[inline]
+    pub fn unquantized_bytes(&self) -> usize {
+        self.count * (3 + 6 + 1 + 48) * 4
+    }
+
+    /// Memory savings ratio (`unquantized_bytes / total_bytes`).
+    #[inline]
+    pub fn compression_ratio(&self) -> f32 {
+        let q = self.total_bytes();
+        if q == 0 {
+            1.0
+        } else {
+            self.unquantized_bytes() as f32 / q as f32
+        }
+    }
+}
+
+#[cfg(test)]
+mod quantized_tests {
+    use super::*;
+
+    #[test]
+    fn test_octahedral_rotation_and_quantized_soa_roundtrip() {
+        let mut scene = GaussianSceneSoa::new();
+        let mut raw = RawPlyVertex::ZERO;
+        raw.position = [0.5, -0.25, 1.5];
+        raw.opacity = 1.2;
+        raw.scale = [-1.2, -1.8, -0.9];
+        raw.rot = [0.8, 0.3, -0.2, 0.4];
+        raw.f_dc = [0.4, -0.2, 0.6];
+        raw.f_rest[0] = 0.15;
+        raw.f_rest[15] = -0.12;
+        raw.f_rest[30] = 0.08;
+        scene.push_raw(&raw);
+
+        let q3 = scene.quantize();
+        let rec3 = q3.to_soa();
+        for k in 0..6 {
+            assert!((scene.covariances_3d[k] - rec3.covariances_3d[k]).abs() < 2e-3);
+        }
+        for k in 0..48 {
+            assert!((scene.sh_coeffs[k] - rec3.sh_coeffs[k]).abs() < 2e-3);
+        }
+        assert!(q3.compression_ratio() > 1.8);
+
+        let q2 = scene.quantize_with_degree(2);
+        assert!(q2.compression_ratio() > 2.5);
+
+        let r = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.7, 1.1).normalize();
+        let decoded = decode_octahedral_rotation(encode_octahedral_rotation(r));
+        assert!(r.angle_between(decoded) < 0.01);
+    }
 }
 
 impl Default for GaussianSceneSoa {

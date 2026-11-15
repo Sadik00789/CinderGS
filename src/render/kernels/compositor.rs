@@ -57,6 +57,7 @@ pub fn tile_compositor_kernel(
     let mut shared_rgb_r = Shared::<[f32]>::new_slice(256usize);
     let mut shared_rgb_g = Shared::<[f32]>::new_slice(256usize);
     let mut shared_rgb_b = Shared::<[f32]>::new_slice(256usize);
+    let mut active_threads = Shared::<[u32]>::new_slice(256usize);
 
     let mut c_r = 0.0f32;
     let mut c_g = 0.0f32;
@@ -243,9 +244,469 @@ pub fn tile_compositor_kernel(
 
         // Barrier: Ensure all threads finished using current shared memory before next batch
         sync_cube();
+
+        // Tile-wide early transmittance termination (T < epsilon across all 256 pixels).
+        active_threads[local_id as usize] = if inside_screen && !saturated {
+            1u32
+        } else {
+            0u32
+        };
+        sync_cube();
+        if local_id_u32 < 128u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 128usize];
+        }
+        sync_cube();
+        if local_id_u32 < 64u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 64usize];
+        }
+        sync_cube();
+        if local_id_u32 < 32u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 32usize];
+        }
+        sync_cube();
+        if local_id_u32 < 16u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 16usize];
+        }
+        sync_cube();
+        if local_id_u32 < 8u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 8usize];
+        }
+        sync_cube();
+        if local_id_u32 < 4u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 4usize];
+        }
+        sync_cube();
+        if local_id_u32 < 2u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 2usize];
+        }
+        sync_cube();
+        if local_id_u32 < 1u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 1usize];
+        }
+        sync_cube();
+
+        if active_threads[0usize] == 0u32 {
+            break;
+        }
     }
 
     // Final color write
+    if inside_screen {
+        let final_r = f32::clamp(c_r + t * bg_r, 0.0f32, 1.0f32);
+        let final_g = f32::clamp(c_g + t * bg_g, 0.0f32, 1.0f32);
+        let final_b = f32::clamp(c_b + t * bg_b, 0.0f32, 1.0f32);
+        let mut final_a = f32::clamp(1.0f32 - t, 0.0f32, 1.0f32);
+        if is_empty {
+            final_a = bg_a;
+        }
+
+        let out_base = (py * screen_width + px) as usize * 4usize;
+        output_pixels[out_base] = final_r;
+        output_pixels[out_base + 1usize] = final_g;
+        output_pixels[out_base + 2usize] = final_b;
+        output_pixels[out_base + 3usize] = final_a;
+    }
+}
+
+#[cube]
+fn unpack_f16_comp(bits: u32) -> f32 {
+    let h = bits & 0xFFFFu32;
+    let sign_bit = (h >> 15u32) & 1u32;
+    let exp = (h >> 10u32) & 0x1Fu32;
+    let mant = h & 0x3FFu32;
+    let sign = if sign_bit == 1u32 { -1.0f32 } else { 1.0f32 };
+
+    if exp == 0u32 {
+        sign * (mant as f32) * 5.9604645e-8f32
+    } else if exp == 31u32 {
+        sign * 65504.0f32
+    } else {
+        sign * (1.0f32 + (mant as f32) * 0.0009765625f32) * f32::powf(2.0f32, exp as f32 - 15.0f32)
+    }
+}
+
+#[cube]
+fn unpack_sh_coeff(sh_f16_packed: &[u32], word_base: usize, coeff_idx: usize) -> f32 {
+    let word = sh_f16_packed[word_base + (coeff_idx / 2usize)];
+    let bits = if (coeff_idx % 2usize) == 0usize {
+        word & 0xFFFFu32
+    } else {
+        (word >> 16u32) & 0xFFFFu32
+    };
+    unpack_f16_comp(bits)
+}
+
+/// Quantized variant of [`tile_compositor_kernel`] reading `f16`-packed SH coefficients
+/// (`sh_words_per_splat` `u32` words per splat) with tile-wide early transmittance termination.
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::manual_div_ceil,
+    clippy::too_many_arguments
+)]
+#[cube(launch)]
+pub fn tile_compositor_quantized_kernel(
+    points_xy: &[f32],
+    conics: &[f32],
+    opacities: &[f32],
+    sh_coeffs_f16_packed: &[u32],
+    positions_3d: &[f32],
+    sorted_entries: &[u32],
+    tile_ranges: &[u32],
+    output_pixels: &mut [f32],
+    screen_width: u32,
+    screen_height: u32,
+    tiles_x: u32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
+    cam_pos_x: f32,
+    cam_pos_y: f32,
+    cam_pos_z: f32,
+    sh_degree: u32,
+) {
+    let tx = CUBE_POS_X;
+    let ty = CUBE_POS_Y;
+    let local_id = UNIT_POS;
+    let local_id_u32 = local_id as u32;
+
+    let lx = local_id_u32 % 16u32;
+    let ly = local_id_u32 / 16u32;
+
+    let px = tx * 16u32 + lx;
+    let py = ty * 16u32 + ly;
+    let inside_screen = px < screen_width && py < screen_height;
+
+    let tile_id = ty * tiles_x + tx;
+    let range_start = tile_ranges[tile_id as usize * 2usize];
+    let range_end = tile_ranges[tile_id as usize * 2usize + 1usize];
+    let is_empty = range_start >= range_end;
+
+    let bases_per_ch = if sh_degree == 0u32 {
+        1usize
+    } else if sh_degree == 1u32 {
+        4usize
+    } else if sh_degree == 2u32 {
+        9usize
+    } else {
+        16usize
+    };
+    let sh_words_per_splat = (bases_per_ch * 3usize + 1usize) / 2usize;
+    let rest_per_ch = bases_per_ch - 1usize;
+    let r_rest = 3usize;
+    let g_rest = 3usize + rest_per_ch;
+    let b_rest = 3usize + rest_per_ch * 2usize;
+
+    let mut shared_xy_x = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_xy_y = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_a = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_b = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_c = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_opacity = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_r = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_g = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_b = Shared::<[f32]>::new_slice(256usize);
+    let mut active_threads = Shared::<[u32]>::new_slice(256usize);
+
+    let mut c_r = 0.0f32;
+    let mut c_g = 0.0f32;
+    let mut c_b = 0.0f32;
+    let mut t = 1.0f32;
+    let mut saturated = false;
+
+    let mut total_in_tile = 0u32;
+    if !is_empty {
+        total_in_tile = range_end - range_start;
+    }
+    let num_batches = (total_in_tile + 255u32) / 256u32;
+
+    let pix_center_x = px as f32 + 0.5f32;
+    let pix_center_y = py as f32 + 0.5f32;
+
+    for b in 0u32..num_batches {
+        let entry_idx = range_start + b * 256u32 + local_id_u32;
+        if entry_idx < range_end {
+            let g = sorted_entries[entry_idx as usize * 3usize + 2usize] as usize;
+            shared_xy_x[local_id as usize] = points_xy[g * 2usize];
+            shared_xy_y[local_id as usize] = points_xy[g * 2usize + 1usize];
+            shared_conic_a[local_id as usize] = conics[g * 3usize];
+            shared_conic_b[local_id as usize] = conics[g * 3usize + 1usize];
+            shared_conic_c[local_id as usize] = conics[g * 3usize + 2usize];
+            shared_opacity[local_id as usize] = opacities[g];
+
+            let pos_x = positions_3d[g * 3usize];
+            let pos_y = positions_3d[g * 3usize + 1usize];
+            let pos_z = positions_3d[g * 3usize + 2usize];
+
+            let vx = pos_x - cam_pos_x;
+            let vy = pos_y - cam_pos_y;
+            let vz = pos_z - cam_pos_z;
+            let inv_len = 1.0f32 / f32::max(f32::sqrt(vx * vx + vy * vy + vz * vz), 1e-8f32);
+            let x = vx * inv_len;
+            let y = vy * inv_len;
+            let z = vz * inv_len;
+
+            let word_base = g * sh_words_per_splat;
+            let mut color_r =
+                0.28209479177387814f32 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, 0usize);
+            let mut color_g =
+                0.28209479177387814f32 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, 1usize);
+            let mut color_b =
+                0.28209479177387814f32 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, 2usize);
+
+            if sh_degree >= 1u32 {
+                let y1_0 = -0.4886025119029199f32 * y;
+                let y1_1 = 0.4886025119029199f32 * z;
+                let y1_2 = -0.4886025119029199f32 * x;
+                color_r += y1_0 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest)
+                    + y1_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 1usize)
+                    + y1_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 2usize);
+                color_g += y1_0 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest)
+                    + y1_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 1usize)
+                    + y1_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 2usize);
+                color_b += y1_0 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest)
+                    + y1_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 1usize)
+                    + y1_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 2usize);
+
+                if sh_degree >= 2u32 {
+                    let xx = x * x;
+                    let yy = y * y;
+                    let zz = z * z;
+                    let xy = x * y;
+                    let yz = y * z;
+                    let xz = x * z;
+                    let y2_0 = 1.0925484305920792f32 * xy;
+                    let y2_1 = -1.0925484305920792f32 * yz;
+                    let y2_2 = 0.31539156525252005f32 * (2.0f32 * zz - xx - yy);
+                    let y2_3 = -1.0925484305920792f32 * xz;
+                    let y2_4 = 0.5462742152960396f32 * (xx - yy);
+
+                    color_r += y2_0
+                        * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 3usize)
+                        + y2_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 4usize)
+                        + y2_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 5usize)
+                        + y2_3 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 6usize)
+                        + y2_4 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 7usize);
+                    color_g += y2_0
+                        * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 3usize)
+                        + y2_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 4usize)
+                        + y2_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 5usize)
+                        + y2_3 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 6usize)
+                        + y2_4 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 7usize);
+                    color_b += y2_0
+                        * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 3usize)
+                        + y2_1 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 4usize)
+                        + y2_2 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 5usize)
+                        + y2_3 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 6usize)
+                        + y2_4 * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 7usize);
+
+                    if sh_degree >= 3u32 {
+                        let y3_m3 = -0.5900435899266435f32 * y * (3.0f32 * xx - yy);
+                        let y3_m2 = 2.890611442640554f32 * xy * z;
+                        let y3_m1 = -0.4570457994644658f32 * y * (4.0f32 * zz - xx - yy);
+                        let y3_0 =
+                            0.3731763325901154f32 * z * (2.0f32 * zz - 3.0f32 * xx - 3.0f32 * yy);
+                        let y3_p1 = -0.4570457994644658f32 * x * (4.0f32 * zz - xx - yy);
+                        let y3_p2 = 1.445305721320277f32 * z * (xx - yy);
+                        let y3_p3 = -0.5900435899266435f32 * x * (xx - 3.0f32 * yy);
+
+                        color_r += y3_m3
+                            * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 8usize)
+                            + y3_m2
+                                * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, r_rest + 9usize)
+                            + y3_m1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    r_rest + 10usize,
+                                )
+                            + y3_0
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    r_rest + 11usize,
+                                )
+                            + y3_p1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    r_rest + 12usize,
+                                )
+                            + y3_p2
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    r_rest + 13usize,
+                                )
+                            + y3_p3
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    r_rest + 14usize,
+                                );
+                        color_g += y3_m3
+                            * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 8usize)
+                            + y3_m2
+                                * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, g_rest + 9usize)
+                            + y3_m1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    g_rest + 10usize,
+                                )
+                            + y3_0
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    g_rest + 11usize,
+                                )
+                            + y3_p1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    g_rest + 12usize,
+                                )
+                            + y3_p2
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    g_rest + 13usize,
+                                )
+                            + y3_p3
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    g_rest + 14usize,
+                                );
+                        color_b += y3_m3
+                            * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 8usize)
+                            + y3_m2
+                                * unpack_sh_coeff(sh_coeffs_f16_packed, word_base, b_rest + 9usize)
+                            + y3_m1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    b_rest + 10usize,
+                                )
+                            + y3_0
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    b_rest + 11usize,
+                                )
+                            + y3_p1
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    b_rest + 12usize,
+                                )
+                            + y3_p2
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    b_rest + 13usize,
+                                )
+                            + y3_p3
+                                * unpack_sh_coeff(
+                                    sh_coeffs_f16_packed,
+                                    word_base,
+                                    b_rest + 14usize,
+                                );
+                    }
+                }
+            }
+
+            shared_rgb_r[local_id as usize] = f32::clamp(color_r + 0.5f32, 0.0f32, 1.0f32);
+            shared_rgb_g[local_id as usize] = f32::clamp(color_g + 0.5f32, 0.0f32, 1.0f32);
+            shared_rgb_b[local_id as usize] = f32::clamp(color_b + 0.5f32, 0.0f32, 1.0f32);
+        } else {
+            shared_opacity[local_id as usize] = 0.0f32;
+        }
+
+        sync_cube();
+
+        let batch_count = u32::min(256u32, total_in_tile - b * 256u32);
+        if inside_screen && !saturated {
+            for k in 0u32..batch_count {
+                let op_base = shared_opacity[k as usize];
+                if op_base > 0.003921569f32 {
+                    let mu_x = shared_xy_x[k as usize];
+                    let mu_y = shared_xy_y[k as usize];
+                    let dx = pix_center_x - mu_x;
+                    let dy = pix_center_y - mu_y;
+                    let a = shared_conic_a[k as usize];
+                    let b_coef = shared_conic_b[k as usize];
+                    let c = shared_conic_c[k as usize];
+
+                    let mut q = -0.5f32 * (a * dx * dx + 2.0f32 * b_coef * dx * dy + c * dy * dy);
+                    if q > 0.0f32 {
+                        q = 0.0f32;
+                    }
+                    if q >= -4.0f32 {
+                        let alpha = f32::min(0.99f32, op_base * f32::exp(q));
+                        if alpha >= 0.003921569f32 {
+                            let w = alpha * t;
+                            c_r += w * shared_rgb_r[k as usize];
+                            c_g += w * shared_rgb_g[k as usize];
+                            c_b += w * shared_rgb_b[k as usize];
+                            t *= 1.0f32 - alpha;
+                            if t < 0.001f32 {
+                                saturated = true;
+                                t = 0.0f32;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sync_cube();
+
+        active_threads[local_id as usize] = if inside_screen && !saturated {
+            1u32
+        } else {
+            0u32
+        };
+        sync_cube();
+        if local_id_u32 < 128u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 128usize];
+        }
+        sync_cube();
+        if local_id_u32 < 64u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 64usize];
+        }
+        sync_cube();
+        if local_id_u32 < 32u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 32usize];
+        }
+        sync_cube();
+        if local_id_u32 < 16u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 16usize];
+        }
+        sync_cube();
+        if local_id_u32 < 8u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 8usize];
+        }
+        sync_cube();
+        if local_id_u32 < 4u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 4usize];
+        }
+        sync_cube();
+        if local_id_u32 < 2u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 2usize];
+        }
+        sync_cube();
+        if local_id_u32 < 1u32 {
+            active_threads[local_id as usize] += active_threads[local_id as usize + 1usize];
+        }
+        sync_cube();
+
+        if active_threads[0usize] == 0u32 {
+            break;
+        }
+    }
+
     if inside_screen {
         let final_r = f32::clamp(c_r + t * bg_r, 0.0f32, 1.0f32);
         let final_g = f32::clamp(c_g + t * bg_g, 0.0f32, 1.0f32);

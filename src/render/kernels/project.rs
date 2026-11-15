@@ -200,3 +200,494 @@ pub fn project_gaussians_kernel(
     conics[conic_base + 1] = b;
     conics[conic_base + 2] = c;
 }
+
+/// Decodes IEEE-754 binary16 low 16 bits from a `u32` into `f32` without float bitcasts.
+#[cube]
+pub fn unpack_f16(bits: u32) -> f32 {
+    let h = bits & 0xFFFFu32;
+    let sign_bit = (h >> 15u32) & 1u32;
+    let exp = (h >> 10u32) & 0x1Fu32;
+    let mant = h & 0x3FFu32;
+    let sign = if sign_bit == 1u32 { -1.0f32 } else { 1.0f32 };
+
+    if exp == 0u32 {
+        sign * (mant as f32) * 5.9604645e-8f32
+    } else if exp == 31u32 {
+        sign * 65504.0f32
+    } else {
+        sign * (1.0f32 + (mant as f32) * 0.0009765625f32) * f32::powf(2.0f32, exp as f32 - 15.0f32)
+    }
+}
+
+/// GPU projection kernel with 3D Mip-Splatting variance regularization, 2D EWA opacity
+/// compensation, opacity/sub-pixel/frustum culling, and `visibility_flags` emission
+/// driving indirect tile-binning dispatch.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
+#[cube(launch)]
+pub fn project_gaussians_cull_kernel(
+    positions: &[f32],
+    covariances: &[f32],
+    opacities: &[f32],
+    camera: &[f32],
+    mip_filter_3d_var: f32,
+    min_opacity: f32,
+    min_radius_px: f32,
+    points_xy: &mut [f32],
+    depths: &mut [f32],
+    radii: &mut [i32],
+    conics: &mut [f32],
+    out_opacities: &mut [f32],
+    visibility_flags: &mut [u32],
+    num_gaussians: u32,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx >= num_gaussians as usize {
+        terminate!();
+    }
+
+    visibility_flags[idx] = 0u32;
+    radii[idx] = 0;
+    out_opacities[idx] = 0.0f32;
+
+    let pt_base = idx * 2usize;
+    let conic_base = idx * 3usize;
+    points_xy[pt_base] = 0.0f32;
+    points_xy[pt_base + 1usize] = 0.0f32;
+    conics[conic_base] = 0.0f32;
+    conics[conic_base + 1usize] = 0.0f32;
+    conics[conic_base + 2usize] = 0.0f32;
+
+    let p_base = idx * 3usize;
+    let px = positions[p_base];
+    let py = positions[p_base + 1usize];
+    let pz = positions[p_base + 2usize];
+
+    let w00 = camera[0usize];
+    let w10 = camera[1usize];
+    let w20 = camera[2usize];
+    let w01 = camera[4usize];
+    let w11 = camera[5usize];
+    let w21 = camera[6usize];
+    let w02 = camera[8usize];
+    let w12 = camera[9usize];
+    let w22 = camera[10usize];
+    let w03 = camera[12usize];
+    let w13 = camera[13usize];
+    let w23 = camera[14usize];
+
+    let focal_x = camera[16usize];
+    let focal_y = camera[17usize];
+    let principal_x = camera[18usize];
+    let principal_y = camera[19usize];
+    let viewport_width = camera[20usize];
+    let viewport_height = camera[21usize];
+    let near_plane = camera[22usize];
+
+    let tx = w00 * px + w01 * py + w02 * pz + w03;
+    let ty = w10 * px + w11 * py + w12 * pz + w13;
+    let tz = w20 * px + w21 * py + w22 * pz + w23;
+    depths[idx] = tz;
+
+    if tz <= near_plane {
+        terminate!();
+    }
+
+    let op = opacities[idx];
+    if op < min_opacity {
+        terminate!();
+    }
+
+    let cov_base = idx * 6usize;
+    let mut v_xx = covariances[cov_base];
+    let v_xy = covariances[cov_base + 1usize];
+    let v_xz = covariances[cov_base + 2usize];
+    let mut v_yy = covariances[cov_base + 3usize];
+    let v_yz = covariances[cov_base + 4usize];
+    let mut v_zz = covariances[cov_base + 5usize];
+
+    let mut alpha_3d = op;
+    if mip_filter_3d_var > 0.0f32 {
+        let det_orig = f32::max(
+            v_xx * (v_yy * v_zz - v_yz * v_yz) - v_xy * (v_xy * v_zz - v_xz * v_yz)
+                + v_xz * (v_xy * v_yz - v_xz * v_yy),
+            1e-24f32,
+        );
+        v_xx += mip_filter_3d_var;
+        v_yy += mip_filter_3d_var;
+        v_zz += mip_filter_3d_var;
+        let det_reg = f32::max(
+            v_xx * (v_yy * v_zz - v_yz * v_yz) - v_xy * (v_xy * v_zz - v_xz * v_yz)
+                + v_xz * (v_xy * v_yz - v_xz * v_yy),
+            det_orig,
+        );
+        let comp = f32::sqrt(f32::clamp(det_orig / det_reg, 0.0f32, 1.0f32));
+        alpha_3d = f32::clamp(op * comp, 0.0f32, 1.0f32);
+        if alpha_3d < min_opacity {
+            terminate!();
+        }
+    }
+
+    let k00 = w00 * v_xx + w01 * v_xy + w02 * v_xz;
+    let k01 = w00 * v_xy + w01 * v_yy + w02 * v_yz;
+    let k02 = w00 * v_xz + w01 * v_yz + w02 * v_zz;
+    let k10 = w10 * v_xx + w11 * v_xy + w12 * v_xz;
+    let k11 = w10 * v_xy + w11 * v_yy + w12 * v_yz;
+    let k12 = w10 * v_xz + w11 * v_yz + w12 * v_zz;
+    let k20 = w20 * v_xx + w21 * v_xy + w22 * v_xz;
+    let k21 = w20 * v_xy + w21 * v_yy + w22 * v_yz;
+    let k22 = w20 * v_xz + w21 * v_yz + w22 * v_zz;
+
+    let cam_xx = k00 * w00 + k01 * w01 + k02 * w02;
+    let cam_xy = k00 * w10 + k01 * w11 + k02 * w12;
+    let cam_xz = k00 * w20 + k01 * w21 + k02 * w22;
+    let cam_yy = k10 * w10 + k11 * w11 + k12 * w12;
+    let cam_yz = k10 * w20 + k11 * w21 + k12 * w22;
+    let cam_zz = k20 * w20 + k21 * w21 + k22 * w22;
+
+    let inv_tz = 1.0f32 / tz;
+    let inv_tz2 = inv_tz * inv_tz;
+    let j00 = focal_x * inv_tz;
+    let j02 = -focal_x * tx * inv_tz2;
+    let j11 = focal_y * inv_tz;
+    let j12 = -focal_y * ty * inv_tz2;
+
+    let m00 = j00 * cam_xx + j02 * cam_xz;
+    let m01 = j00 * cam_xy + j02 * cam_yz;
+    let m02 = j00 * cam_xz + j02 * cam_zz;
+    let m11 = j11 * cam_yy + j12 * cam_yz;
+    let m12 = j11 * cam_yz + j12 * cam_zz;
+
+    let sig2d_xx = m00 * j00 + m02 * j02;
+    let sig2d_xy = m01 * j11 + m02 * j12;
+    let sig2d_yy = m11 * j11 + m12 * j12;
+
+    // Pre-filter screen-space 3-sigma radius culling
+    let raw_mid = 0.5f32 * (sig2d_xx + sig2d_yy);
+    let raw_det = f32::max(sig2d_xx * sig2d_yy - sig2d_xy * sig2d_xy, 0.0f32);
+    let raw_discr = f32::sqrt(f32::max(raw_mid * raw_mid - raw_det, 0.0f32));
+    let raw_lambda_max = f32::max(raw_mid + raw_discr, 0.0f32);
+    if 3.0f32 * f32::sqrt(raw_lambda_max) < min_radius_px {
+        terminate!();
+    }
+
+    // 2D EWA low-pass filter with area-conserving opacity compensation
+    let sig_prime_xx = sig2d_xx + 0.3f32;
+    let sig_prime_xy = sig2d_xy;
+    let sig_prime_yy = sig2d_yy + 0.3f32;
+    let det = sig_prime_xx * sig_prime_yy - sig_prime_xy * sig_prime_xy;
+    if det <= 1e-6f32 {
+        terminate!();
+    }
+
+    let comp_2d = f32::sqrt(f32::clamp(raw_det / det, 0.0f32, 1.0f32));
+    let alpha_2d = f32::clamp(alpha_3d * comp_2d, 0.0f32, 1.0f32);
+    if alpha_2d < min_opacity {
+        terminate!();
+    }
+
+    let inv_det = 1.0f32 / det;
+    let a = sig_prime_yy * inv_det;
+    let b = -sig_prime_xy * inv_det;
+    let c = sig_prime_xx * inv_det;
+
+    let mid = 0.5f32 * (sig_prime_xx + sig_prime_yy);
+    let term = f32::max(0.1f32, mid * mid - det);
+    let delta = f32::sqrt(term);
+    let lambda1 = mid + delta;
+    let lambda2 = f32::max(0.1f32, mid - delta);
+    let lambda_max = f32::max(lambda1, lambda2);
+    let radius = f32::clamp(f32::ceil(3.0f32 * f32::sqrt(lambda_max)), 1.0f32, 1024.0f32);
+
+    let mu_x = focal_x * tx * inv_tz + principal_x;
+    let mu_y = focal_y * ty * inv_tz + principal_y;
+    points_xy[pt_base] = mu_x;
+    points_xy[pt_base + 1usize] = mu_y;
+    conics[conic_base] = a;
+    conics[conic_base + 1usize] = b;
+    conics[conic_base + 2usize] = c;
+
+    if mu_x + radius < 0.0f32
+        || mu_x - radius >= viewport_width
+        || mu_y + radius < 0.0f32
+        || mu_y - radius >= viewport_height
+    {
+        terminate!();
+    }
+
+    radii[idx] = radius as i32;
+    out_opacities[idx] = alpha_2d;
+    visibility_flags[idx] = 1u32;
+}
+
+/// GPU projection kernel reading packed `f16` 3D covariances (`3 x u32` words per splat)
+/// with 3D/2D Mip-Splatting filtering and frustum/opacity/radius culling.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
+#[cube(launch)]
+pub fn project_gaussians_quantized_kernel(
+    positions: &[f32],
+    covariances_f16_packed: &[u32],
+    opacities: &[f32],
+    camera: &[f32],
+    mip_filter_3d_var: f32,
+    min_opacity: f32,
+    min_radius_px: f32,
+    points_xy: &mut [f32],
+    depths: &mut [f32],
+    radii: &mut [i32],
+    conics: &mut [f32],
+    out_opacities: &mut [f32],
+    visibility_flags: &mut [u32],
+    num_gaussians: u32,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx >= num_gaussians as usize {
+        terminate!();
+    }
+
+    visibility_flags[idx] = 0u32;
+    radii[idx] = 0;
+    out_opacities[idx] = 0.0f32;
+
+    let pt_base = idx * 2usize;
+    let conic_base = idx * 3usize;
+    points_xy[pt_base] = 0.0f32;
+    points_xy[pt_base + 1usize] = 0.0f32;
+    conics[conic_base] = 0.0f32;
+    conics[conic_base + 1usize] = 0.0f32;
+    conics[conic_base + 2usize] = 0.0f32;
+
+    let p_base = idx * 3usize;
+    let px = positions[p_base];
+    let py = positions[p_base + 1usize];
+    let pz = positions[p_base + 2usize];
+
+    let w00 = camera[0usize];
+    let w10 = camera[1usize];
+    let w20 = camera[2usize];
+    let w01 = camera[4usize];
+    let w11 = camera[5usize];
+    let w21 = camera[6usize];
+    let w02 = camera[8usize];
+    let w12 = camera[9usize];
+    let w22 = camera[10usize];
+    let w03 = camera[12usize];
+    let w13 = camera[13usize];
+    let w23 = camera[14usize];
+
+    let focal_x = camera[16usize];
+    let focal_y = camera[17usize];
+    let principal_x = camera[18usize];
+    let principal_y = camera[19usize];
+    let viewport_width = camera[20usize];
+    let viewport_height = camera[21usize];
+    let near_plane = camera[22usize];
+
+    let tx = w00 * px + w01 * py + w02 * pz + w03;
+    let ty = w10 * px + w11 * py + w12 * pz + w13;
+    let tz = w20 * px + w21 * py + w22 * pz + w23;
+    depths[idx] = tz;
+
+    if tz <= near_plane {
+        terminate!();
+    }
+
+    let op = opacities[idx];
+    if op < min_opacity {
+        terminate!();
+    }
+
+    let cov_base = idx * 3usize;
+    let c_w0 = covariances_f16_packed[cov_base];
+    let c_w1 = covariances_f16_packed[cov_base + 1usize];
+    let c_w2 = covariances_f16_packed[cov_base + 2usize];
+    let mut v_xx = unpack_f16(c_w0);
+    let v_xy = unpack_f16(c_w0 >> 16u32);
+    let v_xz = unpack_f16(c_w1);
+    let mut v_yy = unpack_f16(c_w1 >> 16u32);
+    let v_yz = unpack_f16(c_w2);
+    let mut v_zz = unpack_f16(c_w2 >> 16u32);
+
+    let mut alpha_3d = op;
+    if mip_filter_3d_var > 0.0f32 {
+        let det_orig = f32::max(
+            v_xx * (v_yy * v_zz - v_yz * v_yz) - v_xy * (v_xy * v_zz - v_xz * v_yz)
+                + v_xz * (v_xy * v_yz - v_xz * v_yy),
+            1e-24f32,
+        );
+        v_xx += mip_filter_3d_var;
+        v_yy += mip_filter_3d_var;
+        v_zz += mip_filter_3d_var;
+        let det_reg = f32::max(
+            v_xx * (v_yy * v_zz - v_yz * v_yz) - v_xy * (v_xy * v_zz - v_xz * v_yz)
+                + v_xz * (v_xy * v_yz - v_xz * v_yy),
+            det_orig,
+        );
+        let comp = f32::sqrt(f32::clamp(det_orig / det_reg, 0.0f32, 1.0f32));
+        alpha_3d = f32::clamp(op * comp, 0.0f32, 1.0f32);
+        if alpha_3d < min_opacity {
+            terminate!();
+        }
+    }
+
+    let k00 = w00 * v_xx + w01 * v_xy + w02 * v_xz;
+    let k01 = w00 * v_xy + w01 * v_yy + w02 * v_yz;
+    let k02 = w00 * v_xz + w01 * v_yz + w02 * v_zz;
+    let k10 = w10 * v_xx + w11 * v_xy + w12 * v_xz;
+    let k11 = w10 * v_xy + w11 * v_yy + w12 * v_yz;
+    let k12 = w10 * v_xz + w11 * v_yz + w12 * v_zz;
+    let k20 = w20 * v_xx + w21 * v_xy + w22 * v_xz;
+    let k21 = w20 * v_xy + w21 * v_yy + w22 * v_yz;
+    let k22 = w20 * v_xz + w21 * v_yz + w22 * v_zz;
+
+    let cam_xx = k00 * w00 + k01 * w01 + k02 * w02;
+    let cam_xy = k00 * w10 + k01 * w11 + k02 * w12;
+    let cam_xz = k00 * w20 + k01 * w21 + k02 * w22;
+    let cam_yy = k10 * w10 + k11 * w11 + k12 * w12;
+    let cam_yz = k10 * w20 + k11 * w21 + k12 * w22;
+    let cam_zz = k20 * w20 + k21 * w21 + k22 * w22;
+
+    let inv_tz = 1.0f32 / tz;
+    let inv_tz2 = inv_tz * inv_tz;
+    let j00 = focal_x * inv_tz;
+    let j02 = -focal_x * tx * inv_tz2;
+    let j11 = focal_y * inv_tz;
+    let j12 = -focal_y * ty * inv_tz2;
+
+    let m00 = j00 * cam_xx + j02 * cam_xz;
+    let m01 = j00 * cam_xy + j02 * cam_yz;
+    let m02 = j00 * cam_xz + j02 * cam_zz;
+    let m11 = j11 * cam_yy + j12 * cam_yz;
+    let m12 = j11 * cam_yz + j12 * cam_zz;
+
+    let sig2d_xx = m00 * j00 + m02 * j02;
+    let sig2d_xy = m01 * j11 + m02 * j12;
+    let sig2d_yy = m11 * j11 + m12 * j12;
+
+    let raw_mid = 0.5f32 * (sig2d_xx + sig2d_yy);
+    let raw_det = f32::max(sig2d_xx * sig2d_yy - sig2d_xy * sig2d_xy, 0.0f32);
+    let raw_discr = f32::sqrt(f32::max(raw_mid * raw_mid - raw_det, 0.0f32));
+    let raw_lambda_max = f32::max(raw_mid + raw_discr, 0.0f32);
+    if 3.0f32 * f32::sqrt(raw_lambda_max) < min_radius_px {
+        terminate!();
+    }
+
+    let sig_prime_xx = sig2d_xx + 0.3f32;
+    let sig_prime_xy = sig2d_xy;
+    let sig_prime_yy = sig2d_yy + 0.3f32;
+    let det = sig_prime_xx * sig_prime_yy - sig_prime_xy * sig_prime_xy;
+    if det <= 1e-6f32 {
+        terminate!();
+    }
+
+    let comp_2d = f32::sqrt(f32::clamp(raw_det / det, 0.0f32, 1.0f32));
+    let alpha_2d = f32::clamp(alpha_3d * comp_2d, 0.0f32, 1.0f32);
+    if alpha_2d < min_opacity {
+        terminate!();
+    }
+
+    let inv_det = 1.0f32 / det;
+    let a = sig_prime_yy * inv_det;
+    let b = -sig_prime_xy * inv_det;
+    let c = sig_prime_xx * inv_det;
+
+    let mid = 0.5f32 * (sig_prime_xx + sig_prime_yy);
+    let term = f32::max(0.1f32, mid * mid - det);
+    let delta = f32::sqrt(term);
+    let lambda1 = mid + delta;
+    let lambda2 = f32::max(0.1f32, mid - delta);
+    let lambda_max = f32::max(lambda1, lambda2);
+    let radius = f32::clamp(f32::ceil(3.0f32 * f32::sqrt(lambda_max)), 1.0f32, 1024.0f32);
+
+    let mu_x = focal_x * tx * inv_tz + principal_x;
+    let mu_y = focal_y * ty * inv_tz + principal_y;
+    points_xy[pt_base] = mu_x;
+    points_xy[pt_base + 1usize] = mu_y;
+    conics[conic_base] = a;
+    conics[conic_base + 1usize] = b;
+    conics[conic_base + 2usize] = c;
+
+    if mu_x + radius < 0.0f32
+        || mu_x - radius >= viewport_width
+        || mu_y + radius < 0.0f32
+        || mu_y - radius >= viewport_height
+    {
+        terminate!();
+    }
+
+    radii[idx] = radius as i32;
+    out_opacities[idx] = alpha_2d;
+    visibility_flags[idx] = 1u32;
+}
+
+/// Reduces per-Gaussian `visibility_flags` inside a single 256-thread workgroup to produce
+/// `[workgroups_x, workgroups_y, workgroups_z, surviving_count]` for indirect GPU dispatch.
+#[allow(clippy::unnecessary_cast, clippy::manual_div_ceil)]
+#[cube(launch)]
+pub fn build_indirect_dispatch_kernel(
+    visibility_flags: &[u32],
+    indirect_args: &mut [u32],
+    num_gaussians: u32,
+    dispatch_workgroup_size: u32,
+) {
+    let lid_u32 = UNIT_POS;
+    let lid = lid_u32 as usize;
+    let mut partial = Shared::<[u32]>::new_slice(256usize);
+
+    let mut local_sum = 0u32;
+    let mut i = lid;
+    while i < num_gaussians as usize {
+        if visibility_flags[i] != 0u32 {
+            local_sum += 1u32;
+        }
+        i += 256usize;
+    }
+
+    partial[lid] = local_sum;
+    sync_cube();
+
+    if lid_u32 < 128u32 {
+        partial[lid] += partial[lid + 128usize];
+    }
+    sync_cube();
+    if lid_u32 < 64u32 {
+        partial[lid] += partial[lid + 64usize];
+    }
+    sync_cube();
+    if lid_u32 < 32u32 {
+        partial[lid] += partial[lid + 32usize];
+    }
+    sync_cube();
+    if lid_u32 < 16u32 {
+        partial[lid] += partial[lid + 16usize];
+    }
+    sync_cube();
+    if lid_u32 < 8u32 {
+        partial[lid] += partial[lid + 8usize];
+    }
+    sync_cube();
+    if lid_u32 < 4u32 {
+        partial[lid] += partial[lid + 4usize];
+    }
+    sync_cube();
+    if lid_u32 < 2u32 {
+        partial[lid] += partial[lid + 2usize];
+    }
+    sync_cube();
+    if lid_u32 < 1u32 {
+        partial[lid] += partial[lid + 1usize];
+    }
+    sync_cube();
+
+    if lid_u32 == 0u32 {
+        let surviving = partial[0usize];
+        let wg = u32::max(dispatch_workgroup_size, 1u32);
+        indirect_args[0usize] = if surviving == 0u32 {
+            0u32
+        } else {
+            (surviving + wg - 1u32) / wg
+        };
+        indirect_args[1usize] = 1u32;
+        indirect_args[2usize] = 1u32;
+        indirect_args[3usize] = surviving;
+    }
+}

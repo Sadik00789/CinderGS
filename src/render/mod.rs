@@ -105,6 +105,33 @@ impl ProjectionOutputs {
         let config = TileConfigUniforms::new(screen_width, screen_height, self.count as u32);
         bin_and_sort_gaussians_cpu(&self.points_xy, &self.depths, &self.radii, config)
     }
+
+    /// Indices of Gaussians that survived projection and culling (`radii[i] > 0`).
+    pub fn surviving_indices(&self) -> Vec<u32> {
+        self.radii
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &r)| if r > 0 { Some(idx as u32) } else { None })
+            .collect()
+    }
+
+    /// Computes 1D indirect dispatch arguments sized for surviving splats.
+    pub fn indirect_dispatch_args(&self, workgroup_size: u32) -> IndirectDispatchArgs {
+        IndirectDispatchArgs::for_1d(self.num_surviving() as u32, workgroup_size)
+    }
+
+    /// Compacts culled splats before tile binning so culled splats never emit sort entries.
+    pub fn bin_and_sort_active(&self, screen_width: u32, screen_height: u32) -> TileBinningOutputs {
+        let active = self.surviving_indices();
+        let config = TileConfigUniforms::new(screen_width, screen_height, self.count as u32);
+        bin_and_sort_active_gaussians_cpu(
+            &self.points_xy,
+            &self.depths,
+            &self.radii,
+            &active,
+            config,
+        )
+    }
 }
 
 /// Number of splats processed per parallel chunk during projection.
@@ -179,6 +206,79 @@ pub fn project_scene_cpu(scene: &GaussianSceneSoa, camera: &CameraUniforms) -> P
         radii,
         conics,
         count,
+    }
+}
+
+/// Result of CPU culling projection including EWA/3D-mip compensated opacities,
+/// per-splat visibility flags, and indirect dispatch arguments for surviving splats.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CpuCullingProjection {
+    pub projection: ProjectionOutputs,
+    pub opacities: Vec<f32>,
+    pub visibility_flags: Vec<u32>,
+    pub indirect_dispatch: IndirectDispatchArgs,
+}
+
+/// Dispatches EWA projection with 3D Mip-Splatting, 2D EWA compensation,
+/// and opacity / sub-pixel / frustum culling on CPU.
+pub fn project_scene_cull_cpu(
+    scene: &GaussianSceneSoa,
+    camera: &CameraUniforms,
+    options: &crate::math::ProjectionOptions,
+) -> CpuCullingProjection {
+    let count = scene.len();
+    if count == 0 {
+        return CpuCullingProjection {
+            projection: ProjectionOutputs::empty(),
+            opacities: Vec::new(),
+            visibility_flags: Vec::new(),
+            indirect_dispatch: IndirectDispatchArgs::for_1d(0, 256),
+        };
+    }
+
+    let mut points_xy = vec![0.0f32; count * 2];
+    let mut depths = vec![0.0f32; count];
+    let mut radii = vec![0i32; count];
+    let mut conics = vec![0.0f32; count * 3];
+    let mut out_opacities = vec![0.0f32; count];
+    let mut visibility_flags = vec![0u32; count];
+
+    for i in 0..count {
+        let pos = Vec3::new(
+            scene.positions[i * 3],
+            scene.positions[i * 3 + 1],
+            scene.positions[i * 3 + 2],
+        );
+        let cov = scene.covariance_3d(i);
+        let (splat, comp_alpha) = crate::math::project_ewa_splat_with_culling_and_opacity(
+            pos,
+            &cov,
+            scene.opacities[i],
+            camera,
+            options,
+        );
+        points_xy[i * 2..i * 2 + 2].copy_from_slice(&splat.point_xy);
+        depths[i] = splat.depth;
+        radii[i] = splat.radius;
+        conics[i * 3..i * 3 + 3].copy_from_slice(&splat.conic);
+        out_opacities[i] = comp_alpha;
+        visibility_flags[i] = if splat.radius > 0 { 1 } else { 0 };
+    }
+
+    let projection = ProjectionOutputs {
+        points_xy,
+        depths,
+        radii,
+        conics,
+        count,
+    };
+    let indirect_dispatch = projection.indirect_dispatch_args(256);
+
+    CpuCullingProjection {
+        projection,
+        opacities: out_opacities,
+        visibility_flags,
+        indirect_dispatch,
     }
 }
 

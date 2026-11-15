@@ -1,6 +1,6 @@
 [package]
 name = "cinder_gs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["CinderGS Engine Team"]
@@ -16,6 +16,7 @@ exclude = ["docs/*", "assets/*"]
 [dependencies]
 glam = "0.28"
 bytemuck = { version = "1.18", features = ["derive", "min_const_generics"] }
+half = { version = "2.4", features = ["bytemuck"] }
 anyhow = "1.0"
 thiserror = "1.0"
 cubecl = { version = "0.11.0", features = ["wgpu"] }

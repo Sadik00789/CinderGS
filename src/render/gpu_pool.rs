@@ -2,6 +2,41 @@ use crate::deformation::DeformationUniforms;
 use crate::render::camera::CameraUniforms;
 use crate::render::rasterizer::CompositorUniforms;
 use crate::render::tiles::TileConfigUniforms;
+use bytemuck::{Pod, Zeroable};
+
+/// GPU indirect compute dispatch arguments matching WGPU's `dispatch_workgroups_indirect`
+/// layout (`[workgroups_x, workgroups_y, workgroups_z]`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct IndirectDispatchArgs {
+    pub workgroups_x: u32,
+    pub workgroups_y: u32,
+    pub workgroups_z: u32,
+}
+
+impl IndirectDispatchArgs {
+    /// Computes 1D indirect dispatch counts covering `active_elements` with `workgroup_size` threads each.
+    #[inline]
+    pub const fn for_1d(active_elements: u32, workgroup_size: u32) -> Self {
+        let wg = if workgroup_size == 0 {
+            1
+        } else {
+            workgroup_size
+        };
+        Self {
+            workgroups_x: if active_elements == 0 {
+                0
+            } else {
+                active_elements.div_ceil(wg)
+            },
+            workgroups_y: 1,
+            workgroups_z: 1,
+        }
+    }
+
+    /// Total byte size (12 bytes) of a WGPU indirect compute dispatch buffer.
+    pub const BYTE_SIZE: usize = std::mem::size_of::<Self>();
+}
 
 /// Calculates the next capacity with a 1.5x exponential growth factor.
 #[inline]
@@ -136,6 +171,34 @@ impl GpuBufferPool {
             0,
             bytemuck::bytes_of(uniforms),
         );
+    }
+
+    /// Allocates a WGPU buffer usable for `dispatch_workgroups_indirect`.
+    pub fn create_indirect_dispatch_buffer(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+    ) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<IndirectDispatchArgs>() as u64,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Writes `IndirectDispatchArgs` into an indirect dispatch buffer.
+    #[inline]
+    pub fn write_indirect_dispatch(
+        &self,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        args: IndirectDispatchArgs,
+    ) {
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(&args));
     }
 }
 

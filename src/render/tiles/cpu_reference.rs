@@ -301,6 +301,106 @@ pub fn bin_and_sort_gaussians_cpu(
     }
 }
 
+/// Compact active-only tile binning: operates exclusively on `surviving_indices`
+/// (from GPU or CPU culling), ensuring culled splats never allocate prefix-sum or
+/// scatter key entries.
+pub fn bin_and_sort_active_gaussians_cpu(
+    points_xy: &[f32],
+    depths: &[f32],
+    radii: &[i32],
+    surviving_indices: &[u32],
+    config: TileConfigUniforms,
+) -> TileBinningOutputs {
+    if surviving_indices.is_empty() || config.total_tiles == 0 {
+        return TileBinningOutputs {
+            sorted_entries: Vec::new(),
+            tile_ranges: vec![TileRange::new(0, 0); config.total_tiles as usize],
+            total_entries: 0,
+            config,
+        };
+    }
+
+    let mut active_tile_counts = Vec::with_capacity(surviving_indices.len());
+    let mut offsets = Vec::with_capacity(surviving_indices.len());
+    let mut running = 0u32;
+
+    for &gid in surviving_indices {
+        let g = gid as usize;
+        let radius = radii.get(g).copied().unwrap_or(0);
+        offsets.push(running);
+        if radius <= 0 {
+            active_tile_counts.push(0);
+            continue;
+        }
+        let mu_x = points_xy[g * 2];
+        let mu_y = points_xy[g * 2 + 1];
+        let Some((min_tx, max_tx, min_ty, max_ty)) = compute_gaussian_tile_bounds(
+            mu_x,
+            mu_y,
+            radius as f32,
+            config.tiles_x,
+            config.tiles_y,
+            config.screen_width,
+            config.screen_height,
+        ) else {
+            active_tile_counts.push(0);
+            continue;
+        };
+        let touched = (max_tx - min_tx + 1) * (max_ty - min_ty + 1);
+        active_tile_counts.push(touched);
+        running += touched;
+    }
+
+    let total_entries = running as usize;
+    if total_entries == 0 {
+        return TileBinningOutputs {
+            sorted_entries: Vec::new(),
+            tile_ranges: vec![TileRange::new(0, 0); config.total_tiles as usize],
+            total_entries: 0,
+            config,
+        };
+    }
+
+    let mut entries = Vec::with_capacity(total_entries);
+    for (slot, &gid) in surviving_indices.iter().enumerate() {
+        if active_tile_counts[slot] == 0 {
+            continue;
+        }
+        let g = gid as usize;
+        let mu_x = points_xy[g * 2];
+        let mu_y = points_xy[g * 2 + 1];
+        let radius = radii[g] as f32;
+        let depth = depths[g];
+        let Some((min_tx, max_tx, min_ty, max_ty)) = compute_gaussian_tile_bounds(
+            mu_x,
+            mu_y,
+            radius,
+            config.tiles_x,
+            config.tiles_y,
+            config.screen_width,
+            config.screen_height,
+        ) else {
+            continue;
+        };
+        for ty in min_ty..=max_ty {
+            for tx in min_tx..=max_tx {
+                let tile_id = ty * config.tiles_x + tx;
+                entries.push(SortEntry::new(SortKey::new(tile_id, depth), gid));
+            }
+        }
+    }
+
+    sort_entries(&mut entries);
+    let tile_ranges = identify_tile_ranges(&entries, config.total_tiles);
+
+    TileBinningOutputs {
+        sorted_entries: entries,
+        tile_ranges,
+        total_entries,
+        config,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +539,19 @@ mod tests {
         let out = bin_and_sort_gaussians_cpu(&points, &depths, &radii, config);
         let ranges = identify_tile_ranges(&out.sorted_entries, config.total_tiles);
         assert_eq!(ranges, out.tile_ranges);
+    }
+
+    #[test]
+    fn test_bin_and_sort_active_skips_culled_splats() {
+        let config = TileConfigUniforms::new(128, 128, 4);
+        let points = [8.0f32, 8.0, 500.0, 500.0, 24.0, 8.0, -50.0, -50.0];
+        let depths = [1.0f32, 2.0, 1.5, 0.5];
+        let radii = [2, 0, 2, 0];
+        let surviving = [0u32, 2u32];
+        let active_out =
+            bin_and_sort_active_gaussians_cpu(&points, &depths, &radii, &surviving, config);
+        let full_out = bin_and_sort_gaussians_cpu(&points, &depths, &radii, config);
+        assert_eq!(active_out.sorted_entries, full_out.sorted_entries);
+        assert_eq!(active_out.tile_ranges, full_out.tile_ranges);
     }
 }

@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "cinder_gs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -684,6 +684,7 @@ dependencies = [
  "egui-wgpu",
  "getrandom 0.2.17",
  "glam",
+ "half",
  "image",
  "memmap2",
  "pollster",
