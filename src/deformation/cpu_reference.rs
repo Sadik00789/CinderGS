@@ -1,5 +1,10 @@
-use crate::deformation::polar::higham_polar_decomposition;
-use crate::deformation::{CageScene, DeformationUniforms, GaussianBinding, TetMesh};
+use crate::deformation::polar::{higham_polar_decomposition, jacobian_singular_values};
+use crate::deformation::{
+    CageScene, DEFAULT_SPLIT_STRETCH_THRESHOLD, DeformationUniforms, GaussianBinding, TetMesh,
+};
+use crate::math::covariance::{
+    DEFAULT_MIP_FILTER_3D_VAR, apply_mip_filter_3d, split_gaussian_along_major_axis,
+};
 use crate::math::covariance_matrix_from_slice;
 use crate::parallel;
 use crate::render::rasterizer::sh_rotation::ShRotator;
@@ -14,13 +19,29 @@ pub struct DeformedSceneOutput {
     pub scene: GaussianSceneSoa,
 }
 
-/// Per-tetrahedron transform: deformation gradient plus its polar rotation.
+impl DeformedSceneOutput {
+    /// Returns a cloned [`GaussianSceneSoa`] for canonical/deferred consumers.
+    #[inline]
+    pub fn to_soa(&self, _sh_degree: u32) -> GaussianSceneSoa {
+        self.scene.clone()
+    }
+
+    /// Consumes this output and yields its inner [`GaussianSceneSoa`].
+    #[inline]
+    pub fn into_soa(self) -> GaussianSceneSoa {
+        self.scene
+    }
+}
+
+/// Per-tetrahedron transform: deformation gradient, polar rotation, and max principal stretch.
 #[derive(Clone, Copy, Debug)]
 pub struct TetTransform {
     /// Deformation gradient $J = D_s D_m^{-1}$.
     pub jacobian: Mat3,
     /// Proper rotation $R \in \mathrm{SO}(3)$ of the polar decomposition $J = RP$.
     pub rotation: Mat3,
+    /// Maximum singular value $\sigma_1$ of $J$.
+    pub max_stretch: f32,
 }
 
 const DEFORM_CHUNK_SIZE: usize = 1024;
@@ -59,8 +80,13 @@ fn tet_transforms(tet_mesh: &TetMesh, deformed_vertices: &[[f32; 3]]) -> Vec<Tet
 
         let jacobian = ds * inv_dm;
         let (rotation, _) = higham_polar_decomposition(jacobian);
+        let max_stretch = jacobian_singular_values(jacobian).max_stretch();
 
-        transforms.push(TetTransform { jacobian, rotation });
+        transforms.push(TetTransform {
+            jacobian,
+            rotation,
+            max_stretch,
+        });
     }
 
     transforms
@@ -160,6 +186,13 @@ where
     let mut out_covariances = vec![0.0f32; count * 6];
     let mut out_opacities = vec![0.0f32; count];
     let mut out_sh = vec![0.0f32; count * 48];
+    let split_threshold = uniforms.split_threshold();
+    let mip_filter_3d_var = uniforms.mip_filter_3d_var();
+    let mut needs_split = if split_threshold > 0.0 {
+        vec![0u8; count]
+    } else {
+        Vec::new()
+    };
 
     parallel::zip_fill_4(
         &mut out_positions,
@@ -192,9 +225,21 @@ where
                 let rest_alpha = scene.opacities[i];
 
                 let Some((cage, tet, weights)) = resolve(i) else {
+                    let (final_cov, final_alpha) = if mip_filter_3d_var > 0.0 {
+                        apply_mip_filter_3d(&rest_cov, rest_alpha, mip_filter_3d_var)
+                    } else {
+                        (rest_cov, rest_alpha)
+                    };
                     write_static(
-                        pos_chunk, cov_chunk, opa_chunk, sh_chunk, local, rest_pos, rest_cov,
-                        rest_alpha, rest_sh,
+                        pos_chunk,
+                        cov_chunk,
+                        opa_chunk,
+                        sh_chunk,
+                        local,
+                        rest_pos,
+                        final_cov,
+                        final_alpha,
+                        rest_sh,
                     );
                     continue;
                 };
@@ -204,9 +249,21 @@ where
                     || cage >= meshes.len()
                     || tet >= transforms[cage].len()
                 {
+                    let (final_cov, final_alpha) = if mip_filter_3d_var > 0.0 {
+                        apply_mip_filter_3d(&rest_cov, rest_alpha, mip_filter_3d_var)
+                    } else {
+                        (rest_cov, rest_alpha)
+                    };
                     write_static(
-                        pos_chunk, cov_chunk, opa_chunk, sh_chunk, local, rest_pos, rest_cov,
-                        rest_alpha, rest_sh,
+                        pos_chunk,
+                        cov_chunk,
+                        opa_chunk,
+                        sh_chunk,
+                        local,
+                        rest_pos,
+                        final_cov,
+                        final_alpha,
+                        rest_sh,
                     );
                     continue;
                 }
@@ -244,13 +301,104 @@ where
         },
     );
 
+    if split_threshold > 0.0 {
+        for (i, flag) in needs_split.iter_mut().enumerate().take(count) {
+            if let Some((cage, tet, _)) = resolve(i)
+                && cage < transforms.len()
+                && tet < transforms[cage].len()
+                && transforms[cage][tet].max_stretch > split_threshold
+            {
+                *flag = 1;
+            }
+        }
+    }
+
+    let mut total_count = count;
+    if split_threshold > 0.0 {
+        for (i, &flag) in needs_split.iter().enumerate().take(count) {
+            if flag == 0 {
+                if mip_filter_3d_var > 0.0 {
+                    let cov = [
+                        out_covariances[i * 6],
+                        out_covariances[i * 6 + 1],
+                        out_covariances[i * 6 + 2],
+                        out_covariances[i * 6 + 3],
+                        out_covariances[i * 6 + 4],
+                        out_covariances[i * 6 + 5],
+                    ];
+                    let (reg_cov, reg_alpha) =
+                        apply_mip_filter_3d(&cov, out_opacities[i], mip_filter_3d_var);
+                    out_covariances[i * 6..i * 6 + 6].copy_from_slice(&reg_cov);
+                    out_opacities[i] = reg_alpha;
+                }
+                continue;
+            }
+
+            let center = Vec3::new(
+                out_positions[i * 3],
+                out_positions[i * 3 + 1],
+                out_positions[i * 3 + 2],
+            );
+            let cov = [
+                out_covariances[i * 6],
+                out_covariances[i * 6 + 1],
+                out_covariances[i * 6 + 2],
+                out_covariances[i * 6 + 3],
+                out_covariances[i * 6 + 4],
+                out_covariances[i * 6 + 5],
+            ];
+            let alpha = out_opacities[i];
+            let [child_a, child_b] = split_gaussian_along_major_axis(center, &cov, alpha);
+
+            let (cov_a, alpha_a) = if mip_filter_3d_var > 0.0 {
+                apply_mip_filter_3d(&child_a.covariance_3d, child_a.opacity, mip_filter_3d_var)
+            } else {
+                (child_a.covariance_3d, child_a.opacity)
+            };
+            let pos_a = center + child_a.offset;
+            out_positions[i * 3] = pos_a.x;
+            out_positions[i * 3 + 1] = pos_a.y;
+            out_positions[i * 3 + 2] = pos_a.z;
+            out_covariances[i * 6..i * 6 + 6].copy_from_slice(&cov_a);
+            out_opacities[i] = alpha_a;
+
+            let (cov_b, alpha_b) = if mip_filter_3d_var > 0.0 {
+                apply_mip_filter_3d(&child_b.covariance_3d, child_b.opacity, mip_filter_3d_var)
+            } else {
+                (child_b.covariance_3d, child_b.opacity)
+            };
+            let pos_b = center + child_b.offset;
+            out_positions.extend_from_slice(&[pos_b.x, pos_b.y, pos_b.z]);
+            out_covariances.extend_from_slice(&cov_b);
+            out_opacities.push(alpha_b);
+            let sh_start = i * 48;
+            out_sh.extend_from_within(sh_start..sh_start + 48);
+            total_count += 1;
+        }
+    } else if mip_filter_3d_var > 0.0 {
+        for i in 0..count {
+            let cov = [
+                out_covariances[i * 6],
+                out_covariances[i * 6 + 1],
+                out_covariances[i * 6 + 2],
+                out_covariances[i * 6 + 3],
+                out_covariances[i * 6 + 4],
+                out_covariances[i * 6 + 5],
+            ];
+            let (reg_cov, reg_alpha) =
+                apply_mip_filter_3d(&cov, out_opacities[i], mip_filter_3d_var);
+            out_covariances[i * 6..i * 6 + 6].copy_from_slice(&reg_cov);
+            out_opacities[i] = reg_alpha;
+        }
+    }
+
     DeformedSceneOutput {
         scene: GaussianSceneSoa {
             positions: out_positions,
             covariances_3d: out_covariances,
             opacities: out_opacities,
             sh_coeffs: out_sh,
-            count,
+            count: total_count,
         },
     }
 }
@@ -315,6 +463,82 @@ pub fn deform_cage_scene_cpu(
         }
         Some((binding.cage as usize, binding.tet as usize, binding.weights))
     })
+}
+
+/// Adaptive variant of [`deform_scene_cpu`] enabling strain-driven transient
+/// splitting and 3D Mip-Splatting variance regularization using either the thresholds
+/// configured in `uniforms` or the defaults (`DEFAULT_SPLIT_STRETCH_THRESHOLD` /
+/// `DEFAULT_MIP_FILTER_3D_VAR`).
+pub fn deform_scene_adaptive_cpu(
+    scene: &GaussianSceneSoa,
+    tet_mesh: &TetMesh,
+    bindings: &[GaussianBinding],
+    deformed_vertices: &[[f32; 3]],
+    uniforms: &DeformationUniforms,
+) -> DeformedSceneOutput {
+    let mut adaptive = *uniforms;
+    if adaptive.split_threshold() <= 0.0 {
+        adaptive = adaptive.with_strain_splitting(DEFAULT_SPLIT_STRETCH_THRESHOLD);
+    }
+    if adaptive.mip_filter_3d_var() <= 0.0 {
+        adaptive = adaptive.with_mip_filter_3d(DEFAULT_MIP_FILTER_3D_VAR);
+    }
+    deform_scene_cpu(scene, tet_mesh, bindings, deformed_vertices, &adaptive)
+}
+
+/// Adaptive variant of [`deform_cage_scene_cpu`] enabling strain-driven transient
+/// splitting and 3D Mip-Splatting variance regularization.
+pub fn deform_cage_scene_adaptive_cpu(
+    scene: &GaussianSceneSoa,
+    cages: &CageScene,
+    uniforms: &DeformationUniforms,
+) -> DeformedSceneOutput {
+    let mut adaptive = *uniforms;
+    if adaptive.split_threshold() <= 0.0 {
+        adaptive = adaptive.with_strain_splitting(DEFAULT_SPLIT_STRETCH_THRESHOLD);
+    }
+    if adaptive.mip_filter_3d_var() <= 0.0 {
+        adaptive = adaptive.with_mip_filter_3d(DEFAULT_MIP_FILTER_3D_VAR);
+    }
+    deform_cage_scene_cpu(scene, cages, &adaptive)
+}
+
+#[cfg(test)]
+mod adaptive_splitting_tests {
+    use super::*;
+    use crate::math::compute_covariance_3d;
+    use crate::scene::raw_vertex::RawPlyVertex;
+
+    #[test]
+    fn test_adaptive_splitting_adds_transient_children_without_mutating_rest_scene() {
+        let mut scene = GaussianSceneSoa::new();
+        let mut raw = RawPlyVertex::ZERO;
+        raw.position = [0.5, 0.5, 0.5];
+        raw.opacity = 1.0;
+        raw.scale = [-2.0, -2.0, -2.0];
+        scene.push_raw(&raw);
+        let original_count = scene.count;
+        let original_pos = scene.positions.clone();
+
+        let tet = TetMesh::create_box_cage([0.0; 3], [1.0; 3]);
+        let bindings = tet.bind_gaussians(bytemuck::cast_slice(&scene.positions));
+        let mut deformed = tet.rest_vertices.clone();
+        // Stretch +X face to 2.5x along X, exceeding DEFAULT_SPLIT_STRETCH_THRESHOLD (1.75)
+        for v in &mut deformed {
+            v[0] *= 2.5;
+        }
+
+        let uniforms =
+            DeformationUniforms::new([0.0; 3], 0, scene.count as u32, tet.num_tets() as u32);
+        let out = deform_scene_adaptive_cpu(&scene, &tet, &bindings, &deformed, &uniforms);
+
+        // Rest scene remains immutable, while deformed output splits the elongated Gaussian.
+        assert_eq!(scene.count, original_count);
+        assert_eq!(scene.positions, original_pos);
+        assert_eq!(out.scene.count, 2);
+        let c = compute_covariance_3d(Vec3::splat(0.1), glam::Quat::IDENTITY);
+        assert_eq!(c.len(), 6);
+    }
 }
 
 #[cfg(test)]

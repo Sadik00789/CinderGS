@@ -277,6 +277,210 @@ pub fn project_ewa_splat(
     }
 }
 
+/// Minimum post-filter effective opacity below which a splat is culled ($\approx 1/255$).
+pub const MIN_CULL_OPACITY: f32 = 1.0 / 255.0;
+
+/// Minimum pre-filter $3\sigma$ screen radius in pixels below which sub-pixel splats are culled.
+pub const MIN_EFFECTIVE_RADIUS_PX: f32 = 0.5;
+
+/// Configuration for EWA projection with 3D/2D Mip-Splatting anti-aliasing and GPU-style culling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectionOptions {
+    /// Isotropic 3D Mip-Splatting covariance variance $s_{3\text{D}}$ ($\le 0$ disables).
+    pub mip_filter_3d_var: f32,
+    /// 2D EWA screen-space low-pass filter variance $s_{2\text{D}}$ in squared pixels.
+    pub filter_var_2d: f32,
+    /// Opacity culling threshold after energy-conserving compensation.
+    pub min_opacity: f32,
+    /// Minimum screen-space $3\sigma$ radius (in pixels) before culling sub-pixel splats.
+    pub min_radius_px: f32,
+}
+
+impl Default for ProjectionOptions {
+    fn default() -> Self {
+        Self {
+            mip_filter_3d_var: crate::math::covariance::DEFAULT_MIP_FILTER_3D_VAR,
+            filter_var_2d: LOW_PASS_FILTER_VARIANCE,
+            min_opacity: MIN_CULL_OPACITY,
+            min_radius_px: MIN_EFFECTIVE_RADIUS_PX,
+        }
+    }
+}
+
+/// Projects a single Gaussian splat with optional 3D Mip-Splatting filtering,
+/// 2D EWA low-pass opacity compensation, and opacity / sub-pixel / frustum culling.
+///
+/// Returns `(projected_splat, compensated_opacity)`. When culled, `projected_splat.is_culled()`
+/// is `true` and `compensated_opacity` is `0.0`.
+pub fn project_ewa_splat_with_culling_and_opacity(
+    pos_world: Vec3,
+    cov_3d: &[f32; 6],
+    opacity: f32,
+    camera: &crate::render::camera::CameraUniforms,
+    options: &ProjectionOptions,
+) -> (ProjectedSplat, f32) {
+    let view_matrix = Mat4::from_cols_array(&camera.view_matrix);
+    let t = view_matrix.transform_point3(pos_world);
+    if t.z <= camera.near_plane {
+        return (ProjectedSplat::culled(t.z), 0.0);
+    }
+
+    let (filtered_cov3d, alpha_3d) =
+        crate::math::covariance::apply_mip_filter_3d(cov_3d, opacity, options.mip_filter_3d_var);
+    if alpha_3d < options.min_opacity {
+        return (ProjectedSplat::culled(t.z), 0.0);
+    }
+
+    let jacobian = compute_jacobian(camera.focal_x, camera.focal_y, t.x, t.y, t.z);
+    let w3 = Mat3::from_cols(
+        view_matrix.x_axis.truncate(),
+        view_matrix.y_axis.truncate(),
+        view_matrix.z_axis.truncate(),
+    );
+    let cov_cam = transform_covariance_to_cam(w3, filtered_cov3d);
+    let cov_2d = project_covariance_2d(jacobian, cov_cam);
+
+    // Pre-filter 2D major radius for sub-pixel culling.
+    let raw_mid = 0.5 * (cov_2d[0] + cov_2d[2]);
+    let raw_det = cov_2d[0] * cov_2d[2] - cov_2d[1] * cov_2d[1];
+    let raw_discr = (raw_mid * raw_mid - raw_det).max(0.0).sqrt();
+    let raw_lambda_max = (raw_mid + raw_discr).max(0.0);
+    let raw_radius_px = 3.0 * raw_lambda_max.sqrt();
+    if raw_radius_px < options.min_radius_px {
+        return (ProjectedSplat::culled(t.z), 0.0);
+    }
+
+    let (reg_2d, alpha_2d) =
+        crate::math::covariance::apply_ewa_low_pass_2d(cov_2d, alpha_3d, options.filter_var_2d);
+    if alpha_2d < options.min_opacity {
+        return (ProjectedSplat::culled(t.z), 0.0);
+    }
+
+    let det = reg_2d[0] * reg_2d[2] - reg_2d[1] * reg_2d[1];
+    if det <= MIN_DET_THRESHOLD {
+        return (ProjectedSplat::culled(t.z), 0.0);
+    }
+
+    let inv_det = 1.0 / det;
+    let conic = [
+        reg_2d[2] * inv_det,
+        -reg_2d[1] * inv_det,
+        reg_2d[0] * inv_det,
+    ];
+
+    let mid = 0.5 * (reg_2d[0] + reg_2d[2]);
+    let discr = (mid * mid - det).max(0.1).sqrt();
+    let lambda1 = mid + discr;
+    let lambda2 = (mid - discr).max(0.1);
+    let lambda_max = lambda1.max(lambda2);
+    let radius = (3.0 * lambda_max.sqrt())
+        .ceil()
+        .clamp(MIN_SPLAT_RADIUS, MAX_SPLAT_RADIUS);
+
+    let center = screen_space_center(
+        camera.focal_x,
+        camera.focal_y,
+        camera.principal_x,
+        camera.principal_y,
+        t.x,
+        t.y,
+        t.z,
+    );
+
+    if is_frustum_culled(
+        center[0],
+        center[1],
+        radius,
+        camera.viewport_width,
+        camera.viewport_height,
+    ) {
+        return (
+            ProjectedSplat {
+                point_xy: center,
+                depth: t.z,
+                radius: 0,
+                conic,
+            },
+            0.0,
+        );
+    }
+
+    (
+        ProjectedSplat {
+            point_xy: center,
+            depth: t.z,
+            radius: radius as i32,
+            conic,
+        },
+        alpha_2d,
+    )
+}
+
+/// Convenience wrapper around [`project_ewa_splat_with_culling_and_opacity`] returning only [`ProjectedSplat`].
+pub fn project_ewa_splat_with_culling(
+    pos_world: Vec3,
+    cov_3d: &[f32; 6],
+    opacity: f32,
+    camera: &crate::render::camera::CameraUniforms,
+    options: &ProjectionOptions,
+) -> ProjectedSplat {
+    project_ewa_splat_with_culling_and_opacity(pos_world, cov_3d, opacity, camera, options).0
+}
+
+#[cfg(test)]
+mod culling_tests {
+    use super::*;
+    use crate::render::camera::CameraUniforms;
+
+    #[test]
+    fn test_opacity_and_subpixel_culling_preserve_valid_splats() {
+        let camera = CameraUniforms::from_look_at(
+            Vec3::new(0.0, 0.0, -3.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            0.9,
+            800.0,
+            600.0,
+            0.2,
+        );
+        let opts = ProjectionOptions::default();
+
+        // Low-opacity splat is culled.
+        let transparent = project_ewa_splat_with_culling(
+            Vec3::ZERO,
+            &[0.04, 0.0, 0.0, 0.04, 0.0, 0.04],
+            0.001,
+            &camera,
+            &opts,
+        );
+        assert!(transparent.is_culled());
+
+        // Far sub-pixel splat is culled.
+        let subpixel = project_ewa_splat_with_culling(
+            Vec3::new(0.0, 0.0, 400.0),
+            &[1e-5, 0.0, 0.0, 1e-5, 0.0, 1e-5],
+            0.9,
+            &camera,
+            &ProjectionOptions {
+                mip_filter_3d_var: 0.0,
+                ..opts
+            },
+        );
+        assert!(subpixel.is_culled());
+
+        // Visible splat survives with positive radius and finite conic.
+        let visible = project_ewa_splat_with_culling(
+            Vec3::ZERO,
+            &[0.04, 0.0, 0.0, 0.04, 0.0, 0.04],
+            0.8,
+            &camera,
+            &opts,
+        );
+        assert!(!visible.is_culled());
+        assert!(visible.radius > 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

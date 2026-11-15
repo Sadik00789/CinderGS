@@ -47,6 +47,96 @@ pub fn extract_rotation(j: Mat3) -> Mat3 {
     higham_polar_decomposition(j).0
 }
 
+/// Singular values and principal stretch axis extracted from a 3D deformation gradient $J$.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JacobianStrain {
+    /// Singular values sorted descending: $\sigma_1 \ge \sigma_2 \ge \sigma_3 \ge 0$.
+    pub sigma: [f32; 3],
+    /// Unit principal stretch direction in world space (left singular vector $\mathbf{u}_1$).
+    pub major_axis_world: glam::Vec3,
+    /// Signed volume ratio $\det(J)$.
+    pub determinant: f32,
+}
+
+impl JacobianStrain {
+    /// Maximum principal stretch ratio ($\sigma_1$).
+    #[inline]
+    pub fn max_stretch(&self) -> f32 {
+        self.sigma[0]
+    }
+
+    /// Minimum principal stretch ratio ($\sigma_3$).
+    #[inline]
+    pub fn min_stretch(&self) -> f32 {
+        self.sigma[2]
+    }
+
+    /// Stretch anisotropy ratio $\sigma_1 / \max(\sigma_3, 10^{-4})$.
+    #[inline]
+    pub fn anisotropy_ratio(&self) -> f32 {
+        self.sigma[0] / self.sigma[2].max(1e-4)
+    }
+
+    /// Returns `true` when the maximum principal stretch exceeds `threshold`.
+    #[inline]
+    pub fn exceeds_stretch(&self, threshold: f32) -> bool {
+        threshold > 0.0 && self.sigma[0] > threshold
+    }
+}
+
+/// Computes the singular values of the deformation gradient $J$ via eigendecomposition
+/// of the right Cauchy-Green strain tensor $C = J^T J$.
+pub fn jacobian_singular_values(j: Mat3) -> JacobianStrain {
+    let c = j.transpose() * j;
+    let packed = [
+        c.x_axis.x, c.x_axis.y, c.x_axis.z, c.y_axis.y, c.y_axis.z, c.z_axis.z,
+    ];
+    let (evals, right_basis) = crate::math::covariance::symmetric_eigen_3x3(&packed);
+    let sigma = [
+        evals[0].max(0.0).sqrt(),
+        evals[1].max(0.0).sqrt(),
+        evals[2].max(0.0).sqrt(),
+    ];
+    let major_axis_world = (j * right_basis.x_axis)
+        .try_normalize()
+        .unwrap_or(glam::Vec3::X);
+
+    JacobianStrain {
+        sigma,
+        major_axis_world,
+        determinant: j.determinant(),
+    }
+}
+
+#[cfg(test)]
+mod strain_tests {
+    use super::*;
+
+    #[test]
+    fn test_jacobian_singular_values_anisotropic_stretch() {
+        let j = Mat3::from_diagonal(glam::Vec3::new(2.5, 1.0, 0.5));
+        let strain = jacobian_singular_values(j);
+        assert!((strain.max_stretch() - 2.5).abs() < 1e-4);
+        assert!((strain.min_stretch() - 0.5).abs() < 1e-4);
+        assert!(strain.exceeds_stretch(1.75));
+        assert!(!strain.exceeds_stretch(2.6));
+        assert!(
+            strain.major_axis_world.abs_diff_eq(glam::Vec3::X, 1e-4)
+                || strain.major_axis_world.abs_diff_eq(-glam::Vec3::X, 1e-4)
+        );
+    }
+
+    #[test]
+    fn test_jacobian_singular_values_rotation_invariant() {
+        let rot = Mat3::from_rotation_y(0.7) * Mat3::from_rotation_x(-0.4);
+        let j = rot * Mat3::from_diagonal(glam::Vec3::new(3.0, 1.2, 0.8));
+        let strain = jacobian_singular_values(j);
+        assert!((strain.max_stretch() - 3.0).abs() < 1e-4);
+        assert!((strain.sigma[1] - 1.2).abs() < 1e-4);
+        assert!((strain.min_stretch() - 0.8).abs() < 1e-4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
