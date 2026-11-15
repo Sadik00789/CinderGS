@@ -149,23 +149,35 @@ In addition to tetrahedral cages, closed triangular cages (`PolyCageMesh`, loada
 
 ## ⚡ Measured Performance
 
-Benchmarked via `cargo run --release --bin benchmark` under identical workload conditions:
+Benchmarked on `v1.0.1` via `cargo run --release --bin benchmark` under identical workload conditions:
 
-- **Workload**: 100,000 synthetic Gaussians at 1920×1080 resolution (~1.5 million generated tile entries)
+- **Workload**: 100,000 synthetic Gaussians at 1920×1080 resolution (1,505,993 generated tile entries)
 - **CPU**: 12 execution threads (Rayon work-stealing pool)
 - **GPU**: NVIDIA GeForce RTX 3050 Laptop GPU (Vulkan backend, CubeCL 0.11)
 
 | Pipeline Stage | CPU Reference | CubeCL GPU (Dispatch + Readback) | Speedup |
 | :--- | :---: | :---: | :---: |
-| **Stage 1 — Cage Deformation** | 5.31 ms | 9.48 ms | Reference faster on small mesh |
-| **Stage 2 — EWA Projection** | 1.14 ms | 7.20 ms | Reference faster (no dispatch overhead) |
-| **Stage 3 — Tile Binning & Sort (CPU)** | 31.12 ms | 28.91 ms | Deterministic CPU sort |
-| **Stage 4 — Tile Compositor** | 239.06 ms | 91.38 ms | **2.62× GPU speedup** |
-| **Sum of Stages** | **276.63 ms** | **136.98 ms** | **2.02× aggregate speedup** |
-| **End-to-End Frame (Static View / Cached Sort)** | **252.93 ms** (4.0 FPS) | **108.36 ms** (9.2 FPS) | **2.33× total throughput** |
+| **Stage 1 — Cage Deformation** | 4.98 ms | 10.55 ms | Reference faster on small mesh |
+| **Stage 2 — EWA Projection** | 1.18 ms | 7.46 ms | Reference faster (no dispatch overhead) |
+| **Stage 3 — Tile Binning & Sort (CPU)** | 31.88 ms | 30.51 ms | Deterministic CPU sort |
+| **Stage 4 — Tile Compositor** | 250.21 ms | 96.19 ms | **2.60× GPU speedup** |
+| **Sum of Stages** | **288.25 ms** | **144.72 ms** | **1.99× aggregate speedup** |
+| **End-to-End Frame (Static View / Cached Sort)** | **268.92 ms** (3.7 FPS) | **125.35 ms** (8.0 FPS) | **2.15× total throughput** |
 
 > [!NOTE]
-> During static camera views or minor cage movements, the **Sort Cache** reuses Stage 3 binning structures, reducing end-to-end frame time below the raw stage summation. Micro-benchmarks for individual CPU stages can be verified using `cargo bench --bench stages`.
+> During static camera views or minor cage movements, the **Sort Cache** reuses Stage 3 binning structures, reducing end-to-end frame time below the raw stage summation.
+
+### Criterion CPU Stage Microbenchmarks
+
+Measured via `cargo bench --bench stages` (20,000 synthetic Gaussians at 1280×720, median estimate across 10 Criterion samples):
+
+| Criterion Benchmark | Median Time | 95% Confidence Interval |
+| :--- | :---: | :---: |
+| `stage1_deformation_20k` | 1.46 ms | 1.44 ms – 1.50 ms |
+| `stage2_projection_20k_720p` | 252.5 µs | 248.6 µs – 255.5 µs |
+| `stage3_binning_20k_720p` | 5.33 ms | 5.30 ms – 5.39 ms |
+| `stage4_compositor_720p` | 80.01 ms | 79.77 ms – 80.29 ms |
+| `end_to_end_cpu_720p` | 87.41 ms | 86.07 ms – 90.98 ms |
 
 ---
 
