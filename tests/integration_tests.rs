@@ -1633,3 +1633,220 @@ fn test_deliverable_wireframe_edge_deduplication() {
         );
     }
 }
+
+#[test]
+fn test_v101_strain_adaptive_splitting_and_mip_filter_end_to_end() {
+    use cinder_gs::deformation::{
+        DEFAULT_SPLIT_STRETCH_THRESHOLD, DeformationUniforms, TetMesh, deform_scene_adaptive_cpu,
+    };
+    use cinder_gs::math::covariance::{
+        DEFAULT_MIP_FILTER_3D_VAR, apply_ewa_low_pass_2d, symmetric_eigen_3x3,
+    };
+    use cinder_gs::scene::RawPlyVertex;
+
+    let mut scene = GaussianSceneSoa::new();
+    let mut raw = RawPlyVertex::ZERO;
+    raw.position = [0.5, 0.5, 0.5];
+    raw.opacity = 1.5;
+    raw.scale = [-2.2, -2.2, -2.2];
+    raw.f_dc = [0.6, 0.3, 0.2];
+    scene.push_raw(&raw);
+    let snapshot_positions = scene.positions.clone();
+    let snapshot_covs = scene.covariances_3d.clone();
+
+    let tet = TetMesh::create_box_cage([0.0; 3], [1.0; 3]);
+    let bindings = tet.bind_gaussians(&[[0.5, 0.5, 0.5]]);
+    let mut deformed = tet.rest_vertices.clone();
+    for v in &mut deformed {
+        v[0] *= 2.5;
+    }
+
+    let uniforms = DeformationUniforms::new([0.0, 0.0, 3.0], 0, 1, tet.num_tets() as u32)
+        .with_strain_splitting(DEFAULT_SPLIT_STRETCH_THRESHOLD)
+        .with_mip_filter_3d(DEFAULT_MIP_FILTER_3D_VAR);
+    let output = deform_scene_adaptive_cpu(&scene, &tet, &bindings, &deformed, &uniforms);
+
+    // Canonical rest-state SoA remains strictly unmutated.
+    assert_eq!(scene.count, 1);
+    assert_eq!(scene.positions, snapshot_positions);
+    assert_eq!(scene.covariances_3d, snapshot_covs);
+
+    // Stretched Gaussian was transiently split into 2 collinear children separated along X.
+    assert_eq!(output.scene.count, 2);
+    assert!((output.scene.positions[0] - output.scene.positions[3]).abs() > 0.05);
+    let cov0: [f32; 6] = output.scene.covariances_3d[0..6].try_into().unwrap();
+    let (evals, _) = symmetric_eigen_3x3(&cov0);
+    assert!(evals[0] > 0.0 && evals[2] > 0.0);
+
+    // 2D EWA low-pass filter regularizes sub-pixel covariance and attenuates opacity.
+    let (reg_cov, atten_alpha) = apply_ewa_low_pass_2d([0.01, 0.0, 0.01], 0.9, 0.3);
+    assert!(reg_cov[0] > 0.3 && reg_cov[2] > 0.3);
+    assert!(atten_alpha < 0.9);
+}
+
+#[test]
+fn test_v101_culling_indirect_dispatch_and_quantized_footprint() {
+    use cinder_gs::math::projection::ProjectionOptions;
+    use cinder_gs::render::camera::CameraUniforms;
+    use cinder_gs::render::gpu_pool::IndirectDispatchArgs;
+    use cinder_gs::render::project_scene_cull_cpu;
+    use cinder_gs::scene::RawPlyVertex;
+    use glam::Mat4;
+
+    let mut scene = GaussianSceneSoa::with_capacity(36);
+    for i in 0..32 {
+        let x = ((i % 4) as f32 - 1.5) * 0.2;
+        let y = ((i / 4) as f32 - 3.5) * 0.15;
+        let mut raw = RawPlyVertex::ZERO;
+        raw.position = [x, y, 3.0];
+        raw.opacity = 1.0;
+        raw.scale = [-2.5, -2.5, -2.5];
+        scene.push_raw(&raw);
+    }
+    // 4 cullable outliers: behind camera, far offscreen, tiny sub-pixel, near-transparent.
+    for &(pos, scale, opa) in &[
+        ([0.0, 0.0, -2.0], [-2.5; 3], 1.0),
+        ([50.0, 50.0, 3.0], [-2.5; 3], 1.0),
+        ([0.0, 0.0, 3.0], [-14.0; 3], 1.0),
+        ([0.0, 0.0, 3.0], [-2.5; 3], -8.0),
+    ] {
+        let mut raw = RawPlyVertex::ZERO;
+        raw.position = pos;
+        raw.opacity = opa;
+        raw.scale = scale;
+        scene.push_raw(&raw);
+    }
+
+    let camera = CameraUniforms::new(Mat4::IDENTITY, 128.0, 128.0, 64.0, 64.0, 128.0, 128.0, 0.2);
+    let culled = project_scene_cull_cpu(
+        &scene,
+        &camera,
+        &ProjectionOptions {
+            mip_filter_3d_var: 0.001,
+            min_opacity: 0.02,
+            min_radius_px: 0.5,
+            ..ProjectionOptions::default()
+        },
+    );
+    assert_eq!(culled.projection.num_surviving(), 32);
+    assert_eq!(
+        culled.indirect_dispatch,
+        IndirectDispatchArgs::for_1d(32, 256)
+    );
+    let binning = culled.projection.bin_and_sort_active(128, 128);
+    assert!(
+        binning.sorted_entries.iter().all(|e| e.gaussian_id < 32),
+        "culled outliers must never enter sorted tile bins"
+    );
+
+    let quantized = scene.quantize();
+    let f32_cov_sh_bytes = (scene.covariances_3d.len() + scene.sh_coeffs.len()) * 4;
+    let q_cov_sh_bytes =
+        (quantized.covariances_f16_packed.len() + quantized.sh_coeffs_f16_packed.len()) * 4;
+    assert!(
+        q_cov_sh_bytes * 2 <= f32_cov_sh_bytes,
+        "quantized f16 packing did not cut cov+SH memory by >= 2x ({q_cov_sh_bytes} vs {f32_cov_sh_bytes})"
+    );
+}
+
+#[test]
+fn test_v101_mvc_cage_pinning_collision_and_timeline_export() {
+    use cinder_gs::app::{CameraPose, Keyframe, Timeline};
+    use cinder_gs::deformation::{
+        Cage, CageScene, CageSpringSimulator, CollisionPlane, PolyCageMesh,
+    };
+    use cinder_gs::scene::PlyLoader;
+    use glam::Vec3;
+
+    let obj = "\
+v -1 -1 -1
+v  1 -1 -1
+v  1  1 -1
+v -1  1 -1
+v -1 -1  1
+v  1 -1  1
+v  1  1  1
+v -1  1  1
+f 1 3 2
+f 1 4 3
+f 5 6 7
+f 5 7 8
+f 1 2 6
+f 1 6 5
+f 4 8 7
+f 4 7 3
+f 1 5 8
+f 1 8 4
+f 2 3 7
+f 2 7 6
+";
+    let poly = PolyCageMesh::from_obj_str(obj).expect("OBJ box parses");
+    assert!(poly.is_closed_manifold());
+    let bindings = poly.bind_gaussians(&[[0.2, 0.3, -0.1]]);
+    assert_eq!(bindings.bound_mask, vec![true]);
+
+    let mut scene = GaussianSceneSoa::with_capacity(1);
+    scene.push(
+        [0.2, 0.3, -0.1],
+        [0.02, 0.0, 0.0, 0.02, 0.0, 0.02],
+        0.9,
+        &[0.5; 48],
+    );
+
+    let mut deformed_verts = poly.rest_vertices.clone();
+    for v in &mut deformed_verts {
+        v[0] += 0.4;
+    }
+    let mvc_out = poly.deform_scene_cpu(&scene, &bindings, &deformed_verts, 0, 0.0, 0.0);
+    assert!((mvc_out.scene.positions[0] - 0.6).abs() < 1e-3);
+
+    // Multi-handle pinning + ground collision plane in CageSpringSimulator.
+    let mut sim = CageSpringSimulator::new(poly.rest_vertices.clone());
+    sim.pin_vertex(0);
+    sim.pin_vertex(1);
+    sim.set_pinned_position(0, [-1.0, 1.5, -1.0]);
+    sim.current_positions[2] = Vec3::new(1.0, -3.0, -1.0);
+    sim.velocities[2] = Vec3::new(0.0, -5.0, 0.0);
+    sim.add_collision_plane(CollisionPlane::ground_y(-0.5));
+    sim.step(0.016);
+    assert!((sim.current_positions[0].y - 1.5).abs() < 1e-5);
+    assert!(sim.current_positions[2].y >= -0.5 - 1e-5);
+
+    // Timeline deformed PLY export & deterministic frame sequence.
+    let tet = poly.to_tet_mesh();
+    let cages = CageScene::auto_bind(
+        vec![Cage::new("poly", tet, [0.1, 0.9, 0.6, 1.0])],
+        &scene.positions,
+    );
+    let nv = cages.cages[0].mesh.num_vertices();
+    let mut timeline = Timeline::new();
+    timeline.insert(Keyframe {
+        time: 0.0,
+        camera: CameraPose {
+            target: [0.2, 0.3, 0.0],
+            distance: 3.0,
+            yaw: 0.0,
+            pitch: 0.1,
+        },
+        cage_offsets: vec![[0.0; 3]; nv],
+    });
+    timeline.insert(Keyframe {
+        time: 1.0,
+        camera: CameraPose {
+            target: [0.2, 0.3, 0.0],
+            distance: 3.0,
+            yaw: 0.4,
+            pitch: 0.1,
+        },
+        cage_offsets: vec![[0.5, 0.0, 0.0]; nv],
+    });
+
+    let exported = timeline.export_deformed_ply_bytes_at(1.0, &scene, &cages, 0, 0.0, 0.0);
+    let reloaded = PlyLoader::load_from_bytes(&exported).expect("exported PLY reloads");
+    assert!((reloaded.positions[0] - 0.7).abs() < 1e-4);
+
+    let frames_a = timeline.render_deterministic_sequence(&scene, &cages, 48, 48, 3.0, 0, 0.0, 0.0);
+    let frames_b = timeline.render_deterministic_sequence(&scene, &cages, 48, 48, 3.0, 0, 0.0, 0.0);
+    assert_eq!(frames_a.len(), 3);
+    assert_eq!(frames_a, frames_b);
+}

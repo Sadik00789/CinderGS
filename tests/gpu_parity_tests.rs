@@ -310,3 +310,201 @@ fn test_golden_image_cpu_render_is_stable() {
         "golden image hash changed; got {hash:#018x}"
     );
 }
+
+#[test]
+fn test_gpu_deform_with_splitting_matches_cpu_strain_detection() {
+    use cinder_gs::deformation::deform_scene_adaptive_cpu;
+    use cinder_gs::render::gpu_bridge::deform_geometry_with_splitting_gpu;
+
+    let Some(guard) = gpu_session() else {
+        return;
+    };
+    let gpu = guard.gpu();
+
+    let mut scene = GaussianSceneSoa::with_capacity(2);
+    scene.push(
+        [0.4, 0.5, 0.5],
+        [0.02, 0.0, 0.0, 0.02, 0.0, 0.02],
+        0.9,
+        &[0.5; 48],
+    );
+    scene.push(
+        [0.6, 0.5, 0.5],
+        [0.02, 0.0, 0.0, 0.02, 0.0, 0.02],
+        0.85,
+        &[0.4; 48],
+    );
+
+    let mesh = TetMesh::create_box_cage([0.0; 3], [1.0; 3]);
+    let bindings = mesh.bind_flat_positions(&scene.positions);
+    let mut deformed = mesh.rest_vertices.clone();
+    for v in &mut deformed {
+        v[0] *= 2.4;
+    }
+
+    let gpu_out = deform_geometry_with_splitting_gpu(
+        gpu.client(),
+        &scene.positions,
+        &scene.covariances_3d,
+        &scene.opacities,
+        &mesh,
+        &bindings,
+        &deformed,
+        1.75,
+        0.001,
+    )
+    .expect("GPU adaptive splitting must succeed");
+
+    let uniforms = DeformationUniforms::new([0.0; 3], 0, 2, mesh.num_tets() as u32)
+        .with_strain_splitting(1.75)
+        .with_mip_filter_3d(0.001);
+    let cpu_out = deform_scene_adaptive_cpu(&scene, &mesh, &bindings, &deformed, &uniforms);
+
+    assert_eq!(gpu_out.split_count, 2);
+    assert_eq!(gpu_out.positions.len(), cpu_out.scene.positions.len());
+    for (g, c) in gpu_out.positions.iter().zip(cpu_out.scene.positions.iter()) {
+        assert!((g - c).abs() < 2e-2, "split position mismatch: {g} vs {c}");
+    }
+    for (g, c) in gpu_out.opacities.iter().zip(cpu_out.scene.opacities.iter()) {
+        assert!((g - c).abs() < 2e-2, "split opacity mismatch: {g} vs {c}");
+    }
+}
+
+#[test]
+fn test_gpu_cull_projection_and_indirect_dispatch_match_cpu() {
+    use cinder_gs::math::projection::ProjectionOptions;
+    use cinder_gs::render::gpu_bridge::project_gaussians_cull_gpu;
+    use cinder_gs::render::project_scene_cull_cpu;
+
+    let Some(guard) = gpu_session() else {
+        return;
+    };
+    let gpu = guard.gpu();
+
+    let mut scene = varied_scene();
+    // Append one behind-camera outlier and one ultra-transparent outlier.
+    scene.push(
+        [0.0, 0.0, -3.0],
+        [0.05, 0.0, 0.0, 0.05, 0.0, 0.05],
+        0.9,
+        &[0.4; 48],
+    );
+    scene.push(
+        [0.0, 0.0, 2.0],
+        [0.05, 0.0, 0.0, 0.05, 0.0, 0.05],
+        0.001,
+        &[0.4; 48],
+    );
+
+    let camera = test_camera(96.0, 96.0);
+    let opts = ProjectionOptions {
+        mip_filter_3d_var: 0.001,
+        min_opacity: 0.01,
+        min_radius_px: 0.5,
+        ..ProjectionOptions::default()
+    };
+
+    let cpu_out = project_scene_cull_cpu(&scene, &camera, &opts);
+    let gpu_out = project_gaussians_cull_gpu(
+        gpu.client(),
+        &scene.positions,
+        &scene.covariances_3d,
+        &scene.opacities,
+        &camera,
+        opts.mip_filter_3d_var,
+        opts.min_opacity,
+        opts.min_radius_px,
+    )
+    .expect("GPU culling projection must succeed");
+
+    assert_eq!(
+        gpu_out.surviving_count,
+        cpu_out.projection.num_surviving() as u32
+    );
+    assert_eq!(gpu_out.indirect_dispatch, cpu_out.indirect_dispatch);
+    assert_eq!(gpu_out.visibility_flags, cpu_out.visibility_flags);
+    for (i, &vis) in gpu_out.visibility_flags.iter().enumerate() {
+        if vis != 0 {
+            assert!((gpu_out.projection.depths[i] - cpu_out.projection.depths[i]).abs() < 1e-3);
+            assert!((gpu_out.opacities[i] - cpu_out.opacities[i]).abs() < 5e-3);
+        }
+    }
+}
+
+#[test]
+fn test_gpu_quantized_projection_and_compositor_match_cpu() {
+    use cinder_gs::math::projection::ProjectionOptions;
+    use cinder_gs::render::gpu_bridge::{composite_quantized_gpu, project_gaussians_quantized_gpu};
+    use cinder_gs::render::project_scene_cull_cpu;
+
+    let Some(guard) = gpu_session() else {
+        return;
+    };
+    let gpu = guard.gpu();
+
+    let scene = varied_scene();
+    let quantized = scene.quantize();
+    let camera = test_camera(96.0, 96.0);
+    let opts = ProjectionOptions {
+        mip_filter_3d_var: 0.001,
+        min_opacity: 0.005,
+        min_radius_px: 0.5,
+        ..ProjectionOptions::default()
+    };
+
+    let cpu_proj = project_scene_cull_cpu(&scene, &camera, &opts);
+    let gpu_proj = project_gaussians_quantized_gpu(
+        gpu.client(),
+        &quantized,
+        &camera,
+        opts.mip_filter_3d_var,
+        opts.min_opacity,
+        opts.min_radius_px,
+    )
+    .expect("GPU quantized projection must succeed");
+    assert_eq!(
+        gpu_proj.surviving_count,
+        cpu_proj.projection.num_surviving() as u32
+    );
+
+    let binning = gpu_proj.projection.bin_and_sort_active(96, 96);
+    let compositor = CompositorUniforms::new(96, 96, [0.02, 0.03, 0.05, 1.0], [0.0, 0.0, -1.0], 3);
+
+    let cpu_binning = cpu_proj.projection.bin_and_sort_active(96, 96);
+    let cpu_image = rasterize_scene_cpu(
+        &cpu_proj.projection.points_xy,
+        &cpu_proj.projection.conics,
+        &cpu_proj.opacities,
+        &scene.sh_coeffs,
+        &scene.positions,
+        &cpu_binning.sorted_entries,
+        &cpu_binning.tile_ranges,
+        &compositor,
+    );
+    let gpu_image = composite_quantized_gpu(
+        gpu.client(),
+        &gpu_proj.projection,
+        &gpu_proj.opacities,
+        &quantized,
+        &binning,
+        &compositor,
+    )
+    .expect("GPU quantized compositor must succeed");
+
+    let mut max_diff = 0.0f32;
+    let mut sum_diff = 0.0f64;
+    for (a, b) in cpu_image.rgba_f32.iter().zip(gpu_image.rgba_f32.iter()) {
+        let d = (a - b).abs();
+        max_diff = max_diff.max(d);
+        sum_diff += f64::from(d);
+    }
+    let mean_diff = sum_diff / cpu_image.rgba_f32.len() as f64;
+    assert!(
+        mean_diff < 2e-2,
+        "quantized GPU/CPU mean pixel error too large: {mean_diff}"
+    );
+    assert!(
+        max_diff < 0.1,
+        "quantized GPU/CPU max pixel error too large: {max_diff}"
+    );
+}
