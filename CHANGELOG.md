@@ -5,6 +5,31 @@ All notable changes to **CinderGS** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-15
+
+Feature, performance, and authoring release expanding deformation fidelity, GPU culling/quantization efficiency, and standalone export workflows.
+
+### Added
+- **Strain-Driven Adaptive Splitting & Anti-Aliasing**:
+  - Local Jacobian singular values via polar/symmetric decomposition (`jacobian_singular_values`, `JacobianStrain`) across CPU and GPU deformation stages (`polar.rs`, `cpu_reference.rs`, `kernels/deformation.rs`).
+  - Transient major-axis Gaussian splitting (`split_gaussian_along_major_axis`) when stretch exceeds `strain_split_threshold`, eliminating tension needle artifacts without mutating canonical rest `.ply` buffers.
+  - 3D Mip-Splatting isotropic covariance regularization (`mip_filter_3d_var`) and 2D EWA screen-space low-pass filtering (`filter_var_2d`) across CPU and GPU projection kernels.
+- **GPU-Driven Culling, Indirect Dispatch & Quantized Buffers**:
+  - Frustum, minimum opacity (`min_opacity`), and minimum screen-radius (`min_radius_px`) culling in `kernels/project.rs` and `project_scene_cull_cpu` writing `IndirectDispatchArgs` so culled splats never enter active tile binning (`bin_and_sort_active_gaussians_cpu`).
+  - Compact `QuantizedGaussianSceneSoa` (`scene/soa.rs`) packing symmetric 3D covariances and degree-trimmed SH coefficients into `f16` pairs plus 32-bit octahedral rotations (`encode_octahedral_rotation` / `decode_octahedral_rotation`) for ~1.8×–4.1× memory reduction across SH degrees 3–1, paired with GPU quantized projection/compositor kernels (`gpu_bridge.rs`, `gpu_pool.rs`) and quantized scene telemetry in `wasm.rs`.
+  - Tile-wide early transmittance termination ($T < \epsilon$) in `kernels/compositor.rs`.
+- **Richer Cage Authoring, Constraints & Deterministic Exports**:
+  - Arbitrary closed polygonal cage support via Ju–Schaefer–Warren 3D Mean Value Coordinates (`deformation/mvc.rs`: `PolyCageMesh`, manifold/winding checks, procedural polyhedra, Wavefront `.obj` parser, finite-difference local Jacobians, and `to_tet_mesh()`).
+  - Persistent multi-handle pinning (`pinned_handles`, `pinned_vertices`) and half-space `CollisionPlane` obstacle constraints in `deformation/dynamics.rs` and `app/picker.rs`.
+  - Binary deformed `.ply` snapshot serializer (`PlyLoader::write_binary_ply_bytes`, `PlyLoader::save_file`, `GaussianSceneSoa::to_raw_vertices`) and deterministic timeline sequence rendering (`Timeline::export_deformed_ply_at`, `Timeline::render_deterministic_frames`, `Timeline::export_deterministic_renders`) wired into the `egui` HUD and interactive viewport.
+
+### Fixed
+- Invalidated `SortCache` properly when filter/splitting parameters or cage deformations change.
+- Preserved GPU view-dependent SH rotation parity across deformed cages (`prepare_gpu_sh_coeffs`) and enforced active-only tile binning for culled splats.
+
+### Verification
+- 167 automated tests passing (`cargo test --all-targets`: 125 library unit tests, 7 GPU/CPU parity & golden-image tests, 35 integration tests), zero warnings under `cargo clippy --all-targets -- -D warnings`, clean formatting via `cargo fmt --all -- --check`, and regenerated `docs/cindergs_demo.gif` verified against reference frames.
+
 ## [1.0.0] - 2026-11-14
 
 First stable major release of **CinderGS**, a pure-Rust 3D Gaussian Splatting (3DGS) rasterization and volumetric cage kinematics engine.
