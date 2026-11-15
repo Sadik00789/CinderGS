@@ -1,9 +1,11 @@
 pub mod cpu_reference;
 pub mod dynamics;
+pub mod mvc;
 pub mod polar;
 
 pub use cpu_reference::*;
 pub use dynamics::*;
+pub use mvc::*;
 pub use polar::*;
 
 use crate::parallel;
@@ -118,6 +120,10 @@ impl TetPrecomputed {
 }
 
 /// Uniforms buffer for deformation and SH rotation.
+/// Default maximum principal stretch ($\sigma_1$) above which a deformed
+/// Gaussian is transiently split into two children along its major axis.
+pub const DEFAULT_SPLIT_STRETCH_THRESHOLD: f32 = 1.75;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct DeformationUniforms {
@@ -127,7 +133,37 @@ pub struct DeformationUniforms {
     pub sh_degree: u32,
     pub num_gaussians: u32,
     pub num_tets: u32,
+    /// Slot 0: adaptive stretch split threshold ($\le 0$ disables transient splitting).
+    /// Slot 1: 3D Mip-Splatting filter variance $s_{3\text{D}}$ ($\le 0$ disables 3D mip filter).
     pub _pad: [f32; 2],
+}
+
+impl DeformationUniforms {
+    /// Enables transient strain-driven Gaussian splitting when $\sigma_1 > \text{threshold}$.
+    #[inline]
+    pub fn with_strain_splitting(mut self, threshold: f32) -> Self {
+        self._pad[0] = threshold.max(0.0);
+        self
+    }
+
+    /// Configures the 3D Mip-Splatting isotropic regularization variance $s_{3\text{D}}$.
+    #[inline]
+    pub fn with_mip_filter_3d(mut self, filter_var_3d: f32) -> Self {
+        self._pad[1] = filter_var_3d.max(0.0);
+        self
+    }
+
+    /// Configured strain stretch threshold (`0.0` when disabled).
+    #[inline]
+    pub fn split_threshold(&self) -> f32 {
+        self._pad[0].max(0.0)
+    }
+
+    /// Configured 3D Mip-Splatting variance (`0.0` when disabled).
+    #[inline]
+    pub fn mip_filter_3d_var(&self) -> f32 {
+        self._pad[1].max(0.0)
+    }
 }
 
 impl DeformationUniforms {

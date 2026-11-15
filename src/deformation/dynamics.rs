@@ -1,5 +1,75 @@
 use glam::Vec3;
 
+/// Rigid planar half-space obstacle enforcing $\mathbf{n} \cdot \mathbf{x} \ge d$.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollisionPlane {
+    /// Unit outward plane normal pointing into the allowed half-space.
+    pub normal: Vec3,
+    /// Plane signed offset along `normal`.
+    pub offset: f32,
+    /// Coefficient of restitution in `[0, 1]` along the plane normal.
+    pub restitution: f32,
+    /// Tangential velocity damping in `[0, 1]` applied on contact.
+    pub friction: f32,
+}
+
+impl CollisionPlane {
+    /// Creates a collision plane from an arbitrary normal, signed offset, restitution, and friction.
+    #[inline]
+    pub fn new(normal: Vec3, offset: f32, restitution: f32, friction: f32) -> Self {
+        let unit = if normal.length_squared() > 1e-8 {
+            normal.normalize()
+        } else {
+            Vec3::Y
+        };
+        Self {
+            normal: unit,
+            offset,
+            restitution: restitution.clamp(0.0, 1.0),
+            friction: friction.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Creates a horizontal ground plane blocking motion below `y`.
+    #[inline]
+    pub fn ground_y(y: f32) -> Self {
+        Self::new(Vec3::Y, y, 0.25, 0.2)
+    }
+
+    /// Signed distance from `point` to the allowed half-space (negative means penetration).
+    #[inline]
+    pub fn signed_distance(&self, point: Vec3) -> f32 {
+        self.normal.dot(point) - self.offset
+    }
+
+    /// Projects `point` onto the allowed half-space without changing valid points.
+    #[inline]
+    pub fn clamp_point(&self, point: Vec3) -> Vec3 {
+        let d = self.signed_distance(point);
+        if d < 0.0 {
+            point - self.normal * d
+        } else {
+            point
+        }
+    }
+
+    /// Resolves half-space penetration and reflects/damps incoming velocity.
+    pub fn resolve_contact(&self, pos: &mut Vec3, vel: &mut Vec3) -> bool {
+        let d = self.signed_distance(*pos);
+        if d >= 0.0 {
+            return false;
+        }
+        *pos -= self.normal * d;
+        let vn = vel.dot(self.normal);
+        if vn < 0.0 {
+            let v_norm = self.normal * vn;
+            let v_tan = *vel - v_norm;
+            *vel = v_tan * (1.0 - self.friction) - v_norm * self.restitution;
+        }
+        true
+    }
+}
+
 /// Real-time damped spring physics simulator for interactive volumetric cage elasticity.
 ///
 /// Features:
@@ -10,7 +80,8 @@ use glam::Vec3;
 ///   $$\gamma(\Delta t) = e^{-c \Delta t}, \qquad c = -\ln(\gamma_{60}) \cdot 60$$
 ///   where $\gamma_{60}$ is the velocity retention per 1/60 s frame. Stepping at
 ///   30 Hz, 60 Hz or 144 Hz produces the same physical trajectory.
-/// - Pinning support: Dragged vertex maintains mouse position with zero velocity.
+/// - Transient drag pin (`pinned_index`) and persistent multi-handle pinning (`pinned_vertices`).
+/// - Rigid collision plane half-space constraints (`collision_planes`).
 /// - Outward radial jiggle impulse perturbation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CageSpringSimulator {
@@ -28,6 +99,10 @@ pub struct CageSpringSimulator {
     pub mass: f32,
     /// Currently pinned vertex index (e.g. held by cursor).
     pub pinned_index: Option<usize>,
+    /// Persistent multi-handle pin mask per cage vertex.
+    pub pinned_vertices: Vec<bool>,
+    /// Planar obstacles restricting vertex motion during simulation.
+    pub collision_planes: Vec<CollisionPlane>,
 }
 
 impl CageSpringSimulator {
@@ -52,6 +127,8 @@ impl CageSpringSimulator {
             damping: 0.92,
             mass: 1.0,
             pinned_index: None,
+            pinned_vertices: vec![false; count],
+            collision_planes: Vec::new(),
         }
     }
 
@@ -70,6 +147,86 @@ impl CageSpringSimulator {
         (-Self::damping_coefficient(damping) * dt).exp()
     }
 
+    /// Returns true if `index` is fixed either by the active cursor drag or persistent pin mask.
+    #[inline]
+    pub fn is_vertex_pinned(&self, index: usize) -> bool {
+        self.pinned_index == Some(index)
+            || self.pinned_vertices.get(index).copied().unwrap_or(false)
+    }
+
+    /// Persistently pins cage vertex `index` at its current position.
+    #[inline]
+    pub fn pin_vertex(&mut self, index: usize) {
+        if index < self.pinned_vertices.len() {
+            self.pinned_vertices[index] = true;
+            self.velocities[index] = Vec3::ZERO;
+        }
+    }
+
+    /// Removes persistent pin on cage vertex `index`.
+    #[inline]
+    pub fn unpin_vertex(&mut self, index: usize) {
+        if index < self.pinned_vertices.len() {
+            self.pinned_vertices[index] = false;
+        }
+    }
+
+    /// Toggles persistent pin state on cage vertex `index`, returning the new state.
+    #[inline]
+    pub fn toggle_pin_vertex(&mut self, index: usize) -> bool {
+        if let Some(slot) = self.pinned_vertices.get_mut(index) {
+            *slot = !*slot;
+            if *slot {
+                self.velocities[index] = Vec3::ZERO;
+            }
+            *slot
+        } else {
+            false
+        }
+    }
+
+    /// Clears all persistent multi-handle pins.
+    #[inline]
+    pub fn clear_pins(&mut self) {
+        self.pinned_vertices.fill(false);
+    }
+
+    /// Counts distinct pinned vertices across both persistent pins and active cursor drag.
+    #[inline]
+    pub fn pinned_count(&self) -> usize {
+        self.pinned_vertices
+            .iter()
+            .enumerate()
+            .filter(|&(i, &p)| p || self.pinned_index == Some(i))
+            .count()
+    }
+
+    /// Appends a rigid planar obstacle to this simulator.
+    #[inline]
+    pub fn add_collision_plane(&mut self, plane: CollisionPlane) {
+        self.collision_planes.push(plane);
+    }
+
+    /// Removes all collision planes.
+    #[inline]
+    pub fn clear_collision_planes(&mut self) {
+        self.collision_planes.clear();
+    }
+
+    /// Registered collision planes.
+    #[inline]
+    pub fn collision_planes(&self) -> &[CollisionPlane] {
+        &self.collision_planes
+    }
+
+    /// Clamps `point` to the valid side of every configured collision plane.
+    pub fn project_point_to_collision_planes(&self, mut point: Vec3) -> Vec3 {
+        for plane in &self.collision_planes {
+            point = plane.clamp_point(point);
+        }
+        point
+    }
+
     /// Sets which vertex is currently pinned by user mouse interaction.
     #[inline]
     pub fn set_pinned(&mut self, pinned: Option<usize>) {
@@ -83,7 +240,7 @@ impl CageSpringSimulator {
     #[inline]
     pub fn set_pinned_position(&mut self, index: usize, pos: [f32; 3]) {
         if index < self.current_positions.len() {
-            self.current_positions[index] = Vec3::from(pos);
+            self.current_positions[index] = self.project_point_to_collision_planes(Vec3::from(pos));
             self.velocities[index] = Vec3::ZERO;
         }
     }
@@ -100,7 +257,7 @@ impl CageSpringSimulator {
         let gamma = Self::frame_damping(self.damping, dt_sim);
 
         for i in 0..self.current_positions.len() {
-            if self.pinned_index == Some(i) {
+            if self.is_vertex_pinned(i) {
                 self.velocities[i] = Vec3::ZERO;
                 continue;
             }
@@ -112,6 +269,10 @@ impl CageSpringSimulator {
             // Semi-implicit Euler integration with frame-rate independent damping
             self.velocities[i] = (self.velocities[i] + accel * dt_sim) * gamma;
             self.current_positions[i] += self.velocities[i] * dt_sim;
+
+            for plane in &self.collision_planes {
+                plane.resolve_contact(&mut self.current_positions[i], &mut self.velocities[i]);
+            }
         }
     }
 
@@ -129,7 +290,7 @@ impl CageSpringSimulator {
         centroid /= self.rest_positions.len() as f32;
 
         for i in 0..self.current_positions.len() {
-            if self.pinned_index == Some(i) {
+            if self.is_vertex_pinned(i) {
                 continue;
             }
 
@@ -261,5 +422,30 @@ mod tests {
             (one_second - expected).abs() < 1e-5,
             "expected {expected}, got {one_second}"
         );
+    }
+
+    #[test]
+    fn test_multi_handle_pinning_and_collision_plane() {
+        let rest = vec![[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]];
+        let mut sim = CageSpringSimulator::new(rest);
+        sim.pin_vertex(0);
+        assert!(sim.toggle_pin_vertex(2));
+        assert_eq!(sim.pinned_count(), 2);
+
+        // Move vertex 0 upward and vertex 1 below ground plane y = 0.25.
+        sim.set_pinned_position(0, [0.0, 2.5, 0.0]);
+        sim.current_positions[1] = Vec3::new(1.0, -1.0, 0.0);
+        sim.velocities[1] = Vec3::new(0.0, -4.0, 0.0);
+        sim.add_collision_plane(CollisionPlane::ground_y(0.25));
+
+        sim.step(0.016);
+
+        // Persistently pinned handle remains fixed while unpinned handle cannot go below y = 0.25.
+        assert!((sim.current_positions[0].y - 2.5).abs() < 1e-6);
+        assert!(sim.current_positions[1].y >= 0.25 - 1e-5);
+        assert!(sim.is_vertex_pinned(2));
+
+        sim.clear_pins();
+        assert_eq!(sim.pinned_count(), 0);
     }
 }

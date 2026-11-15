@@ -1,10 +1,12 @@
+use crate::deformation::CollisionPlane;
 use crate::render::camera::CameraUniforms;
 use glam::Vec3;
+use std::collections::BTreeSet;
 
 /// Maximum screen-space Euclidean pixel distance to register a vertex pick.
 pub const PICKING_RADIUS_PIXELS: f32 = 12.0;
 
-/// Screen-space cage vertex picker and eye-plane dragging controller.
+/// Screen-space cage vertex picker, multi-handle pin state, and eye-plane dragging controller.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CagePicker {
     /// Currently selected cage vertex index, if any.
@@ -13,6 +15,8 @@ pub struct CagePicker {
     pub is_dragging: bool,
     /// Last recorded mouse position [x, y] in screen pixels.
     pub last_mouse_pos: Option<[f32; 2]>,
+    /// Persistently pinned handles indexed by `(cage_index, vertex_index)`.
+    pub pinned_handles: BTreeSet<(usize, usize)>,
 }
 
 impl CagePicker {
@@ -178,6 +182,56 @@ impl CagePicker {
         true
     }
 
+    /// Moves the selected vertex of the selected cage along the camera plane while enforcing `planes`.
+    pub fn drag_cage_vertex_constrained(
+        &self,
+        delta: [f32; 2],
+        cages: &mut [Vec<[f32; 3]>],
+        camera: &CameraUniforms,
+        selected: (usize, usize),
+        planes: &[CollisionPlane],
+    ) -> bool {
+        if !self.drag_cage_vertex(delta, cages, camera, selected) {
+            return false;
+        }
+        let (cage_index, vertex_index) = selected;
+        let mut p = Vec3::from(cages[cage_index][vertex_index]);
+        for plane in planes {
+            p = plane.clamp_point(p);
+        }
+        cages[cage_index][vertex_index] = p.to_array();
+        true
+    }
+
+    /// Toggles persistent pin state on `(cage_index, vertex_index)`, returning the new pinned state.
+    pub fn toggle_pin(&mut self, handle: (usize, usize)) -> bool {
+        if self.pinned_handles.contains(&handle) {
+            self.pinned_handles.remove(&handle);
+            false
+        } else {
+            self.pinned_handles.insert(handle);
+            true
+        }
+    }
+
+    /// Returns true if `(cage_index, vertex_index)` is persistently pinned.
+    #[inline]
+    pub fn is_pinned(&self, handle: (usize, usize)) -> bool {
+        self.pinned_handles.contains(&handle)
+    }
+
+    /// Clears all persistently pinned handles.
+    #[inline]
+    pub fn clear_pins(&mut self) {
+        self.pinned_handles.clear();
+    }
+
+    /// Returns the set of persistently pinned `(cage_index, vertex_index)` handles.
+    #[inline]
+    pub fn pinned_handles(&self) -> &BTreeSet<(usize, usize)> {
+        &self.pinned_handles
+    }
+
     /// Clears any selected vertex and ends active drag.
     pub fn clear_selection(&mut self) {
         self.selected_vertex = None;
@@ -240,5 +294,36 @@ mod tests {
         assert!((vertices[0][0] - 0.2).abs() < 1e-5);
         assert!((vertices[0][1] - 0.0).abs() < 1e-5);
         assert!((vertices[0][2] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_picker_multi_pin_and_constrained_drag() {
+        let camera = CameraUniforms::new(
+            Mat4::IDENTITY,
+            1000.0,
+            1000.0,
+            500.0,
+            500.0,
+            1000.0,
+            1000.0,
+            0.2,
+        );
+        let mut picker = CagePicker::new();
+        assert!(picker.toggle_pin((0, 1)));
+        assert!(picker.is_pinned((0, 1)));
+        assert!(!picker.toggle_pin((0, 1)));
+        assert!(picker.pinned_handles().is_empty());
+
+        let mut cages = vec![vec![[0.0, 0.5, 2.0]]];
+        let planes = vec![CollisionPlane::ground_y(0.0)];
+        // Dragging down in screen space (+dy -> negative world Y). Plane clamps y >= 0.0.
+        assert!(picker.drag_cage_vertex_constrained(
+            [0.0, 500.0],
+            &mut cages,
+            &camera,
+            (0, 0),
+            &planes
+        ));
+        assert!(cages[0][0][1] >= -1e-6);
     }
 }
