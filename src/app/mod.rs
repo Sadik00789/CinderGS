@@ -8,10 +8,12 @@ pub use gui::*;
 pub use picker::*;
 pub use timeline::*;
 
-use crate::deformation::{Cage, CageScene, TetMesh};
+use crate::deformation::cpu_reference::deform_cage_scene_cpu;
+use crate::deformation::{Cage, CageScene, CollisionPlane, DeformationUniforms, TetMesh};
 use crate::render::pipeline::RenderPipelineOrchestrator;
 use crate::render::rasterizer::CompositorUniforms;
 use crate::scene::autoframe::compute_scene_framing;
+use crate::scene::ply_loader::PlyLoader;
 use crate::scene::soa::GaussianSceneSoa;
 use glam::Vec3;
 use std::sync::Arc;
@@ -652,11 +654,18 @@ impl ApplicationHandler for CinderApp {
                             );
                             if let Some(selected) = self.gui_state.selected {
                                 let mut cage_vertices = self.cages.deformed_vertices();
-                                if self.picker.drag_cage_vertex(
+                                let planes: Vec<CollisionPlane> = self
+                                    .cages
+                                    .cages
+                                    .get(selected.0)
+                                    .map(|c| c.simulator.collision_planes().to_vec())
+                                    .unwrap_or_default();
+                                if self.picker.drag_cage_vertex_constrained(
                                     [delta_x, delta_y],
                                     &mut cage_vertices,
                                     &camera,
                                     selected,
+                                    &planes,
                                 ) {
                                     let (cage_index, vertex_index) = selected;
                                     let position = cage_vertices
@@ -754,6 +763,100 @@ impl ApplicationHandler for CinderApp {
                     self.timeline.clear();
                     self.gui_state.clear_timeline = false;
                 }
+                if self.gui_state.toggle_pin_selected {
+                    if let Some((cage_index, vertex_index)) = self.gui_state.selected
+                        && let Some(cage) = self.cages.cages.get_mut(cage_index)
+                    {
+                        self.picker.toggle_pin((cage_index, vertex_index));
+                        cage.simulator.toggle_pin_vertex(vertex_index);
+                    }
+                    self.gui_state.toggle_pin_selected = false;
+                }
+                if self.gui_state.clear_pins {
+                    self.picker.clear_pins();
+                    for cage in &mut self.cages.cages {
+                        cage.simulator.clear_pins();
+                    }
+                    self.gui_state.clear_pins = false;
+                }
+
+                for cage in &mut self.cages.cages {
+                    cage.simulator.clear_collision_planes();
+                    if self.gui_state.ground_collision_enabled {
+                        cage.simulator.add_collision_plane(CollisionPlane::ground_y(
+                            self.gui_state.ground_collision_y,
+                        ));
+                    }
+                }
+
+                if self.gui_state.export_deformed_ply {
+                    let total_tets: u32 = self
+                        .cages
+                        .cages
+                        .iter()
+                        .map(|c| c.mesh.num_tets() as u32)
+                        .sum();
+                    let uniforms = DeformationUniforms::new(
+                        self.camera.eye_position().to_array(),
+                        self.gui_state.sh_degree,
+                        self.scene.count as u32,
+                        total_tets,
+                    )
+                    .with_strain_splitting(self.gui_state.strain_split_threshold)
+                    .with_mip_filter_3d(self.gui_state.mip_filter_3d_var);
+                    let deformed = deform_cage_scene_cpu(&self.scene, &self.cages, &uniforms);
+                    let out_path = std::path::PathBuf::from("export_deformed.ply");
+                    match PlyLoader::save_file(&out_path, &deformed.scene) {
+                        Ok(()) => {
+                            self.gui_state.status_message = Some(format!(
+                                "Saved {} ({} splats)",
+                                out_path.display(),
+                                deformed.scene.count
+                            ));
+                        }
+                        Err(err) => {
+                            self.gui_state.status_message =
+                                Some(format!("PLY export failed: {err}"));
+                        }
+                    }
+                    self.gui_state.export_deformed_ply = false;
+                }
+
+                if self.gui_state.export_timeline_renders {
+                    let render_w = self
+                        .orchestrator
+                        .as_ref()
+                        .map(|o| o.offscreen_width.max(1))
+                        .unwrap_or(640);
+                    let render_h = self
+                        .orchestrator
+                        .as_ref()
+                        .map(|o| o.offscreen_height.max(1))
+                        .unwrap_or(480);
+                    match self.timeline.export_deterministic_renders(
+                        "timeline_renders",
+                        &self.scene,
+                        &self.cages,
+                        render_w,
+                        render_h,
+                        30.0,
+                        self.gui_state.sh_degree,
+                        self.gui_state.strain_split_threshold,
+                        self.gui_state.mip_filter_3d_var,
+                    ) {
+                        Ok(paths) => {
+                            self.gui_state.status_message = Some(format!(
+                                "Exported {} timeline frame(s) to timeline_renders/",
+                                paths.len()
+                            ));
+                        }
+                        Err(err) => {
+                            self.gui_state.status_message =
+                                Some(format!("Timeline export failed: {err}"));
+                        }
+                    }
+                    self.gui_state.export_timeline_renders = false;
+                }
 
                 // Timeline playback / scrubbing takes precedence over the spring
                 // simulation; otherwise the cages run their own physics.
@@ -786,6 +889,8 @@ impl ApplicationHandler for CinderApp {
                 };
 
                 orchestrator.backend = self.gui_state.backend;
+                orchestrator.set_strain_split_threshold(self.gui_state.strain_split_threshold);
+                orchestrator.set_mip_filter_3d_var(self.gui_state.mip_filter_3d_var);
 
                 let surface_texture = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(texture)

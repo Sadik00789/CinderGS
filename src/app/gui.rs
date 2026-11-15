@@ -23,6 +23,15 @@ pub struct GuiState {
     pub remove_cage: bool,
     pub bake_keyframe: bool,
     pub clear_timeline: bool,
+    pub toggle_pin_selected: bool,
+    pub clear_pins: bool,
+    pub ground_collision_enabled: bool,
+    pub ground_collision_y: f32,
+    pub strain_split_threshold: f32,
+    pub mip_filter_3d_var: f32,
+    pub export_deformed_ply: bool,
+    pub export_timeline_renders: bool,
+    pub status_message: Option<String>,
     pub gpu_description: Option<String>,
     pub gpu_error: Option<String>,
 }
@@ -48,6 +57,15 @@ impl Default for GuiState {
             remove_cage: false,
             bake_keyframe: false,
             clear_timeline: false,
+            toggle_pin_selected: false,
+            clear_pins: false,
+            ground_collision_enabled: false,
+            ground_collision_y: -1.0,
+            strain_split_threshold: 0.0,
+            mip_filter_3d_var: 0.0,
+            export_deformed_ply: false,
+            export_timeline_renders: false,
+            status_message: None,
             gpu_description: None,
             gpu_error: None,
         }
@@ -123,6 +141,20 @@ pub fn render_gui(
                 ui.label("SH Degree:");
                 ui.add(egui::Slider::new(&mut state.sh_degree, 0..=3));
             });
+            ui.horizontal(|ui| {
+                ui.label("Split Threshold:");
+                ui.add(
+                    egui::Slider::new(&mut state.strain_split_threshold, 0.0..=3.0)
+                        .fixed_decimals(2),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("3D Mip Var:");
+                ui.add(
+                    egui::Slider::new(&mut state.mip_filter_3d_var, 0.0..=0.01)
+                        .fixed_decimals(4),
+                );
+            });
             ui.checkbox(&mut state.show_cage, "Show Cage Wireframe");
 
             ui.separator();
@@ -163,7 +195,19 @@ pub fn render_gui(
                         state.request_reset_cage = true;
                     }
                 });
+                ui.small(format!("Pinned handles: {}", cage.simulator.pinned_count()));
             }
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut state.ground_collision_enabled, "Ground Plane Y:");
+                if state.ground_collision_enabled {
+                    ui.add(
+                        egui::DragValue::new(&mut state.ground_collision_y)
+                            .speed(0.05)
+                            .fixed_decimals(2),
+                    );
+                }
+            });
 
             ui.horizontal(|ui| {
                 if ui.button("Add Cage").clicked() {
@@ -175,7 +219,7 @@ pub fn render_gui(
             });
 
             ui.separator();
-            ui.heading("Keyframe Timeline");
+            ui.heading("Keyframe Timeline & Export");
 
             ui.horizontal(|ui| {
                 ui.checkbox(&mut timeline.playing, "Play");
@@ -194,10 +238,21 @@ pub fn render_gui(
                     state.clear_timeline = true;
                 }
             });
+            ui.horizontal(|ui| {
+                if ui.button("Export Deformed PLY").clicked() {
+                    state.export_deformed_ply = true;
+                }
+                if ui.button("Export Renders").clicked() {
+                    state.export_timeline_renders = true;
+                }
+            });
             ui.small(format!(
                 "{} keyframe(s) — scrubbing applies the interpolated camera and cage pose",
                 timeline.keyframes.len()
             ));
+            if let Some(status) = &state.status_message {
+                ui.small(status);
+            }
 
             ui.separator();
             ui.heading("Cage Interaction");
@@ -206,9 +261,20 @@ pub fn render_gui(
                     egui::Color32::from_rgb(100, 255, 100),
                     format!("Selected: cage {cage}, vertex {vertex}"),
                 );
+                ui.horizontal(|ui| {
+                    if ui.button("Pin / Unpin Handle").clicked() {
+                        state.toggle_pin_selected = true;
+                    }
+                    if ui.button("Clear Pins").clicked() {
+                        state.clear_pins = true;
+                    }
+                });
                 ui.label("Drag with Left Mouse Button to deform");
             } else {
                 ui.label("Click a cage handle to pick and deform");
+                if ui.button("Clear Pins").clicked() {
+                    state.clear_pins = true;
+                }
             }
             if ui.button("Reset Camera").clicked() {
                 state.request_reset_camera = true;

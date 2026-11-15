@@ -669,6 +669,46 @@ impl PlyLoader {
         }
         cast_raw_vertices(&payload[..header.payload_len()])
     }
+
+    /// Serializes a `GaussianSceneSoa` snapshot into canonical binary little-endian 3DGS PLY bytes.
+    pub fn write_binary_ply_bytes(scene: &GaussianSceneSoa) -> Vec<u8> {
+        let raw = scene.to_raw_vertices();
+        let mut header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\n",
+            raw.len()
+        );
+        for name in ["x", "y", "z", "nx", "ny", "nz"] {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        for i in 0..3 {
+            header.push_str(&format!("property float f_dc_{i}\n"));
+        }
+        for i in 0..45 {
+            header.push_str(&format!("property float f_rest_{i}\n"));
+        }
+        header.push_str("property float opacity\n");
+        for i in 0..3 {
+            header.push_str(&format!("property float scale_{i}\n"));
+        }
+        for i in 0..4 {
+            header.push_str(&format!("property float rot_{i}\n"));
+        }
+        header.push_str("end_header\n");
+
+        let payload: &[u8] = bytemuck::cast_slice(&raw);
+        let mut out = Vec::with_capacity(header.len() + payload.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Writes a canonical binary little-endian `.ply` snapshot to `path`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_file(path: impl AsRef<Path>, scene: &GaussianSceneSoa) -> Result<(), PlyError> {
+        let bytes = Self::write_binary_ply_bytes(scene);
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -995,5 +1035,48 @@ mod tests {
             | Err(PlyError::UnsupportedElement { .. }) => {}
             other => panic!("expected extra-element rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_write_binary_ply_roundtrip() {
+        let mut scene = GaussianSceneSoa::with_capacity(2);
+        let mut sh = [0.0f32; 48];
+        sh[0] = 0.5;
+        sh[1] = -0.25;
+        sh[2] = 0.75;
+        sh[3] = 0.1;
+        sh[18] = -0.15;
+        sh[33] = 0.2;
+        scene.push(
+            [0.25, -0.5, 1.25],
+            [0.04, 0.0, 0.0, 0.09, 0.0, 0.02],
+            0.85,
+            &sh,
+        );
+        scene.push(
+            [-1.0, 2.0, 0.5],
+            [0.01, 0.002, 0.0, 0.02, -0.001, 0.03],
+            0.35,
+            &[0.12; 48],
+        );
+
+        let bytes = PlyLoader::write_binary_ply_bytes(&scene);
+        let loaded = PlyLoader::load_from_bytes(&bytes).expect("exported PLY must reload");
+        assert_eq!(loaded.count, 2);
+        for i in 0..6 {
+            assert!((loaded.positions[i] - scene.positions[i]).abs() < 1e-4);
+        }
+        for i in 0..12 {
+            assert!(
+                (loaded.covariances_3d[i] - scene.covariances_3d[i]).abs() < 1e-3,
+                "cov mismatch at {i}: {} vs {}",
+                loaded.covariances_3d[i],
+                scene.covariances_3d[i]
+            );
+        }
+        assert!((loaded.opacities[0] - 0.85).abs() < 1e-4);
+        assert!((loaded.opacities[1] - 0.35).abs() < 1e-4);
+        assert!((loaded.sh_coeffs[0] - 0.5).abs() < 1e-5);
+        assert!((loaded.sh_coeffs[33] - 0.2).abs() < 1e-5);
     }
 }
