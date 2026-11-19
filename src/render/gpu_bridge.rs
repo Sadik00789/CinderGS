@@ -9,10 +9,11 @@ use crate::render::ProjectionOutputs;
 use crate::render::camera::CameraUniforms;
 use crate::render::gpu_pool::IndirectDispatchArgs;
 use crate::render::kernels::{
-    build_indirect_dispatch_kernel, compute_tet_jacobians_kernel, compute_tet_strain_kernel,
-    deform_and_split_gaussians_kernel, deform_gaussians_kernel, project_gaussians_cull_kernel,
-    project_gaussians_kernel, project_gaussians_quantized_kernel, tile_compositor_kernel,
-    tile_compositor_quantized_kernel,
+    compute_tet_jacobians_kernel, compute_tet_transforms_kernel, count_visibility_atomic_kernel,
+    deform_and_split_compact_kernel, deform_gaussians_kernel, finalize_indirect_dispatch_kernel,
+    project_gaussians_cull_kernel, project_gaussians_kernel,
+    project_gaussians_quantized_f16_kernel, project_gaussians_quantized_kernel,
+    tile_compositor_kernel, tile_compositor_quantized_f16_kernel, tile_compositor_quantized_kernel,
 };
 use crate::render::rasterizer::{CompositorUniforms, RasterizedImage};
 use crate::render::tiles::TileBinningOutputs;
@@ -275,27 +276,21 @@ pub fn deform_geometry_with_splitting_gpu(
     let elems_handle = upload_u32(client, &flat_elems);
     let inv_dm_handle = upload_f32(client, &flat_inv_dm);
     let jac_handle = client.empty((num_tets * 9 * 4).max(4));
+    let rot_handle = client.empty((num_tets * 9 * 4).max(4));
     let stretch_handle = client.empty((num_tets * 4).max(4));
 
     let cube_dim_tet = CubeDim::new_1d(64.min(num_tets.max(1) as u32));
     let cube_count_tet = CubeCount::Static((num_tets as u32).div_ceil(64), 1, 1);
 
-    compute_tet_jacobians_kernel::launch(
+    compute_tet_transforms_kernel::launch(
         client,
-        cube_count_tet.clone(),
+        cube_count_tet,
         cube_dim_tet,
         unsafe { BufferArg::from_raw_parts(cage_handle.clone(), flat_cage.len()) },
         unsafe { BufferArg::from_raw_parts(elems_handle.clone(), flat_elems.len()) },
         unsafe { BufferArg::from_raw_parts(inv_dm_handle, flat_inv_dm.len()) },
         unsafe { BufferArg::from_raw_parts(jac_handle.clone(), num_tets * 9) },
-        num_tets as u32,
-    );
-
-    compute_tet_strain_kernel::launch(
-        client,
-        cube_count_tet,
-        cube_dim_tet,
-        unsafe { BufferArg::from_raw_parts(jac_handle.clone(), num_tets * 9) },
+        unsafe { BufferArg::from_raw_parts(rot_handle, num_tets * 9) },
         unsafe { BufferArg::from_raw_parts(stretch_handle.clone(), num_tets) },
         num_tets as u32,
     );
@@ -312,12 +307,13 @@ pub fn deform_geometry_with_splitting_gpu(
     let out_pos_h = client.empty((doubled * 3 * 4).max(4));
     let out_cov_h = client.empty((doubled * 6 * 4).max(4));
     let out_opa_h = client.empty((doubled * 4).max(4));
-    let out_flags_h = client.empty((count * 4).max(4));
+    let out_meta_h = client.empty((count * 2 * 4).max(8));
+    let split_counter_h = upload_u32(client, &[0u32]);
 
     let cube_dim_g = CubeDim::new_1d(256);
     let cube_count_g = CubeCount::Static(((count as u32).div_ceil(256)).max(1), 1, 1);
 
-    deform_and_split_gaussians_kernel::launch(
+    deform_and_split_compact_kernel::launch(
         client,
         cube_count_g,
         cube_dim_g,
@@ -333,37 +329,65 @@ pub fn deform_geometry_with_splitting_gpu(
         unsafe { BufferArg::from_raw_parts(out_pos_h.clone(), doubled * 3) },
         unsafe { BufferArg::from_raw_parts(out_cov_h.clone(), doubled * 6) },
         unsafe { BufferArg::from_raw_parts(out_opa_h.clone(), doubled) },
-        unsafe { BufferArg::from_raw_parts(out_flags_h.clone(), count) },
+        unsafe { BufferArg::from_raw_parts(out_meta_h.clone(), count * 2) },
+        unsafe { BufferArg::from_raw_parts(split_counter_h.clone(), 1) },
         split_threshold.max(0.0),
         mip_filter_3d_var.max(0.0),
         count as u32,
         num_tets as u32,
     );
 
-    let flags = read_u32(client, out_flags_h, "split flags", count)?;
-    let raw_pos = read_f32(client, out_pos_h, "split deformed positions", doubled * 3)?;
-    let raw_cov = read_f32(client, out_cov_h, "split deformed covariances", doubled * 6)?;
-    let raw_opa = read_f32(client, out_opa_h, "split deformed opacities", doubled)?;
+    let split_count =
+        (read_u32(client, split_counter_h, "split counter", 1)?[0] as usize).min(count);
+    let total_active = count + split_count;
 
-    let split_source_indices: Vec<u32> = flags
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &flag)| if flag != 0 { Some(idx as u32) } else { None })
-        .collect();
-    let split_count = split_source_indices.len();
+    let mut positions = read_f32(
+        client,
+        out_pos_h,
+        "split deformed positions",
+        total_active * 3,
+    )?;
+    let mut covariances = read_f32(
+        client,
+        out_cov_h,
+        "split deformed covariances",
+        total_active * 6,
+    )?;
+    let mut opacities = read_f32(client, out_opa_h, "split deformed opacities", total_active)?;
 
-    let mut positions = raw_pos[0..count * 3].to_vec();
-    let mut covariances = raw_cov[0..count * 6].to_vec();
-    let mut opacities = raw_opa[0..count].to_vec();
-    positions.reserve(split_count * 3);
-    covariances.reserve(split_count * 6);
-    opacities.reserve(split_count);
-
-    for &src in &split_source_indices {
-        let slot = count + src as usize;
-        positions.extend_from_slice(&raw_pos[slot * 3..slot * 3 + 3]);
-        covariances.extend_from_slice(&raw_cov[slot * 6..slot * 6 + 6]);
-        opacities.push(raw_opa[slot]);
+    let mut split_source_indices = Vec::with_capacity(split_count);
+    if split_count > 0 {
+        let meta = read_u32(client, out_meta_h, "split metadata", split_count * 2)?;
+        let mut children: Vec<(u32, [f32; 3], [f32; 6], f32)> = Vec::with_capacity(split_count);
+        for c in 0..split_count {
+            let parent_idx = meta[c * 2];
+            let slot = count + c;
+            children.push((
+                parent_idx,
+                [
+                    positions[slot * 3],
+                    positions[slot * 3 + 1],
+                    positions[slot * 3 + 2],
+                ],
+                [
+                    covariances[slot * 6],
+                    covariances[slot * 6 + 1],
+                    covariances[slot * 6 + 2],
+                    covariances[slot * 6 + 3],
+                    covariances[slot * 6 + 4],
+                    covariances[slot * 6 + 5],
+                ],
+                opacities[slot],
+            ));
+        }
+        children.sort_by_key(|entry| entry.0);
+        for (c, (parent_idx, pos, cov, opa)) in children.into_iter().enumerate() {
+            let slot = count + c;
+            positions[slot * 3..slot * 3 + 3].copy_from_slice(&pos);
+            covariances[slot * 6..slot * 6 + 6].copy_from_slice(&cov);
+            opacities[slot] = opa;
+            split_source_indices.push(parent_idx);
+        }
     }
 
     Ok(DeformedGeometry {
@@ -556,6 +580,7 @@ pub fn project_gaussians_cull_gpu(
     let conics_h = client.empty((gaussians * 3 * 4).max(4));
     let out_opa_h = client.empty((gaussians * 4).max(4));
     let vis_h = client.empty((gaussians * 4).max(4));
+    let counter_h = upload_u32(client, &[0u32]);
     let indirect_h = client.empty(16);
 
     let cube_dim = CubeDim::new_1d(256);
@@ -563,7 +588,7 @@ pub fn project_gaussians_cull_gpu(
 
     project_gaussians_cull_kernel::launch(
         client,
-        cube_count,
+        cube_count.clone(),
         cube_dim,
         unsafe { BufferArg::from_raw_parts(pos_handle, positions.len()) },
         unsafe { BufferArg::from_raw_parts(cov_handle, covariances.len()) },
@@ -581,13 +606,21 @@ pub fn project_gaussians_cull_gpu(
         gaussians as u32,
     );
 
-    build_indirect_dispatch_kernel::launch(
+    count_visibility_atomic_kernel::launch(
         client,
-        CubeCount::Static(1, 1, 1),
+        cube_count,
         CubeDim::new_1d(256),
         unsafe { BufferArg::from_raw_parts(vis_h.clone(), gaussians) },
-        unsafe { BufferArg::from_raw_parts(indirect_h.clone(), 4) },
+        unsafe { BufferArg::from_raw_parts(counter_h.clone(), 1) },
         gaussians as u32,
+    );
+
+    finalize_indirect_dispatch_kernel::launch(
+        client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        unsafe { BufferArg::from_raw_parts(counter_h, 1) },
+        unsafe { BufferArg::from_raw_parts(indirect_h.clone(), 4) },
         256u32,
     );
 
@@ -645,38 +678,75 @@ pub fn project_gaussians_quantized_gpu(
     let conics_h = client.empty((gaussians * 3 * 4).max(4));
     let out_opa_h = client.empty((gaussians * 4).max(4));
     let vis_h = client.empty((gaussians * 4).max(4));
+    let counter_h = upload_u32(client, &[0u32]);
     let indirect_h = client.empty(16);
 
     let cube_dim = CubeDim::new_1d(256);
     let cube_count = CubeCount::Static(((gaussians as u32).div_ceil(256)).max(1), 1, 1);
 
-    project_gaussians_quantized_kernel::launch(
+    let use_native_f16 = client
+        .properties()
+        .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16));
+
+    if use_native_f16 {
+        project_gaussians_quantized_f16_kernel::launch(
+            client,
+            cube_count.clone(),
+            cube_dim,
+            unsafe { BufferArg::from_raw_parts(pos_handle, scene.positions.len()) },
+            unsafe { BufferArg::from_raw_parts(cov_f16_handle, gaussians * 6) },
+            unsafe { BufferArg::from_raw_parts(opa_handle, scene.opacities.len()) },
+            unsafe { BufferArg::from_raw_parts(cam_handle, 24) },
+            mip_filter_3d_var.max(0.0),
+            min_opacity.max(0.0),
+            min_radius_px.max(0.0),
+            unsafe { BufferArg::from_raw_parts(pts_h.clone(), gaussians * 2) },
+            unsafe { BufferArg::from_raw_parts(depths_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(radii_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(conics_h.clone(), gaussians * 3) },
+            unsafe { BufferArg::from_raw_parts(out_opa_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(vis_h.clone(), gaussians) },
+            gaussians as u32,
+        );
+    } else {
+        project_gaussians_quantized_kernel::launch(
+            client,
+            cube_count.clone(),
+            cube_dim,
+            unsafe { BufferArg::from_raw_parts(pos_handle, scene.positions.len()) },
+            unsafe {
+                BufferArg::from_raw_parts(cov_f16_handle, scene.covariances_f16_packed.len())
+            },
+            unsafe { BufferArg::from_raw_parts(opa_handle, scene.opacities.len()) },
+            unsafe { BufferArg::from_raw_parts(cam_handle, 24) },
+            mip_filter_3d_var.max(0.0),
+            min_opacity.max(0.0),
+            min_radius_px.max(0.0),
+            unsafe { BufferArg::from_raw_parts(pts_h.clone(), gaussians * 2) },
+            unsafe { BufferArg::from_raw_parts(depths_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(radii_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(conics_h.clone(), gaussians * 3) },
+            unsafe { BufferArg::from_raw_parts(out_opa_h.clone(), gaussians) },
+            unsafe { BufferArg::from_raw_parts(vis_h.clone(), gaussians) },
+            gaussians as u32,
+        );
+    }
+
+    count_visibility_atomic_kernel::launch(
         client,
         cube_count,
-        cube_dim,
-        unsafe { BufferArg::from_raw_parts(pos_handle, scene.positions.len()) },
-        unsafe { BufferArg::from_raw_parts(cov_f16_handle, scene.covariances_f16_packed.len()) },
-        unsafe { BufferArg::from_raw_parts(opa_handle, scene.opacities.len()) },
-        unsafe { BufferArg::from_raw_parts(cam_handle, 24) },
-        mip_filter_3d_var.max(0.0),
-        min_opacity.max(0.0),
-        min_radius_px.max(0.0),
-        unsafe { BufferArg::from_raw_parts(pts_h.clone(), gaussians * 2) },
-        unsafe { BufferArg::from_raw_parts(depths_h.clone(), gaussians) },
-        unsafe { BufferArg::from_raw_parts(radii_h.clone(), gaussians) },
-        unsafe { BufferArg::from_raw_parts(conics_h.clone(), gaussians * 3) },
-        unsafe { BufferArg::from_raw_parts(out_opa_h.clone(), gaussians) },
+        CubeDim::new_1d(256),
         unsafe { BufferArg::from_raw_parts(vis_h.clone(), gaussians) },
+        unsafe { BufferArg::from_raw_parts(counter_h.clone(), 1) },
         gaussians as u32,
     );
 
-    build_indirect_dispatch_kernel::launch(
+    finalize_indirect_dispatch_kernel::launch(
         client,
         CubeCount::Static(1, 1, 1),
-        CubeDim::new_1d(256),
-        unsafe { BufferArg::from_raw_parts(vis_h.clone(), gaussians) },
+        CubeDim::new_1d(1),
+        unsafe { BufferArg::from_raw_parts(counter_h, 1) },
         unsafe { BufferArg::from_raw_parts(indirect_h.clone(), 4) },
-        gaussians as u32,
         256u32,
     );
 
@@ -754,32 +824,71 @@ pub fn composite_quantized_gpu(
     let cube_dim = CubeDim::new_1d(256);
     let cube_count = CubeCount::Static(uniforms.tiles_x, uniforms.tiles_y, 1);
 
-    tile_compositor_quantized_kernel::launch(
-        client,
-        cube_count,
-        cube_dim,
-        unsafe { BufferArg::from_raw_parts(pts_h, projection.points_xy.len()) },
-        unsafe { BufferArg::from_raw_parts(con_h, projection.conics.len()) },
-        unsafe { BufferArg::from_raw_parts(opa_h, opacities.len()) },
-        unsafe {
-            BufferArg::from_raw_parts(sh_f16_h, quantized_scene.sh_coeffs_f16_packed.len().max(1))
-        },
-        unsafe { BufferArg::from_raw_parts(pos_h, quantized_scene.positions.len()) },
-        unsafe { BufferArg::from_raw_parts(sorted_h, sorted_entries_flat.len().max(1)) },
-        unsafe { BufferArg::from_raw_parts(ranges_h, tile_ranges_flat.len().max(1)) },
-        unsafe { BufferArg::from_raw_parts(out_pixels_h.clone(), pixel_count * 4) },
-        width,
-        height,
-        uniforms.tiles_x,
-        uniforms.background_color[0],
-        uniforms.background_color[1],
-        uniforms.background_color[2],
-        uniforms.background_color[3],
-        uniforms.camera_position[0],
-        uniforms.camera_position[1],
-        uniforms.camera_position[2],
-        uniforms.sh_degree.min(quantized_scene.sh_degree),
-    );
+    let use_native_f16 = client
+        .properties()
+        .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16));
+
+    if use_native_f16 {
+        tile_compositor_quantized_f16_kernel::launch(
+            client,
+            cube_count,
+            cube_dim,
+            unsafe { BufferArg::from_raw_parts(pts_h, projection.points_xy.len()) },
+            unsafe { BufferArg::from_raw_parts(con_h, projection.conics.len()) },
+            unsafe { BufferArg::from_raw_parts(opa_h, opacities.len()) },
+            unsafe {
+                BufferArg::from_raw_parts(
+                    sh_f16_h,
+                    (quantized_scene.sh_coeffs_f16_packed.len() * 2).max(2),
+                )
+            },
+            unsafe { BufferArg::from_raw_parts(pos_h, quantized_scene.positions.len()) },
+            unsafe { BufferArg::from_raw_parts(sorted_h, sorted_entries_flat.len().max(1)) },
+            unsafe { BufferArg::from_raw_parts(ranges_h, tile_ranges_flat.len().max(1)) },
+            unsafe { BufferArg::from_raw_parts(out_pixels_h.clone(), pixel_count * 4) },
+            width,
+            height,
+            uniforms.tiles_x,
+            uniforms.background_color[0],
+            uniforms.background_color[1],
+            uniforms.background_color[2],
+            uniforms.background_color[3],
+            uniforms.camera_position[0],
+            uniforms.camera_position[1],
+            uniforms.camera_position[2],
+            uniforms.sh_degree.min(quantized_scene.sh_degree),
+        );
+    } else {
+        tile_compositor_quantized_kernel::launch(
+            client,
+            cube_count,
+            cube_dim,
+            unsafe { BufferArg::from_raw_parts(pts_h, projection.points_xy.len()) },
+            unsafe { BufferArg::from_raw_parts(con_h, projection.conics.len()) },
+            unsafe { BufferArg::from_raw_parts(opa_h, opacities.len()) },
+            unsafe {
+                BufferArg::from_raw_parts(
+                    sh_f16_h,
+                    quantized_scene.sh_coeffs_f16_packed.len().max(1),
+                )
+            },
+            unsafe { BufferArg::from_raw_parts(pos_h, quantized_scene.positions.len()) },
+            unsafe { BufferArg::from_raw_parts(sorted_h, sorted_entries_flat.len().max(1)) },
+            unsafe { BufferArg::from_raw_parts(ranges_h, tile_ranges_flat.len().max(1)) },
+            unsafe { BufferArg::from_raw_parts(out_pixels_h.clone(), pixel_count * 4) },
+            width,
+            height,
+            uniforms.tiles_x,
+            uniforms.background_color[0],
+            uniforms.background_color[1],
+            uniforms.background_color[2],
+            uniforms.background_color[3],
+            uniforms.camera_position[0],
+            uniforms.camera_position[1],
+            uniforms.camera_position[2],
+            uniforms.sh_degree.min(quantized_scene.sh_degree),
+        );
+    }
 
     let pixels = read_f32(
         client,

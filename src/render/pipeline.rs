@@ -1,13 +1,9 @@
-use crate::deformation::{CageScene, DeformationUniforms, GaussianBinding, deform_cage_scene_cpu};
+use crate::deformation::{CageScene, DeformationUniforms, deform_cage_scene_cpu};
 use crate::render::blit::{BlitPipeline, OFFSCREEN_FORMAT};
 use crate::render::camera::CameraUniforms;
 use crate::render::gpu::{GpuCompute, GpuError};
-use crate::render::gpu_bridge::{
-    DeformedGeometry, composite_gpu, deform_geometry_gpu, deform_geometry_with_splitting_gpu,
-    project_gaussians_cull_gpu, project_gaussians_gpu,
-};
 use crate::render::gpu_pool::GpuBufferPool;
-use crate::render::rasterizer::sh_rotation::ShRotator;
+use crate::render::gpu_state::GpuPipelineState;
 use crate::render::rasterizer::{CompositorUniforms, RasterizedImage, rasterize_scene_cpu};
 use crate::render::tiles::TileBinningOutputs;
 use crate::render::wireframe::{CageGuide, WireframeRenderer};
@@ -210,6 +206,8 @@ pub struct RenderPipelineOrchestrator {
     pub backend: ExecutionBackend,
     /// Persistent compute client. Created once, never per frame.
     pub gpu: Option<GpuCompute>,
+    /// Persistent VRAM residency, arena, and Stage 3 sort cache for the active GPU device.
+    pub gpu_state: Option<GpuPipelineState>,
     /// Set when GPU acquisition failed, so it is not retried every frame.
     pub gpu_error: Option<String>,
     /// Last per-frame GPU dispatch failure, if any (the frame fell back to CPU).
@@ -240,6 +238,7 @@ impl RenderPipelineOrchestrator {
             offscreen_height: 0,
             backend: ExecutionBackend::CpuReference,
             gpu: None,
+            gpu_state: None,
             gpu_error: None,
             last_backend_error: None,
             sort_cache: SortCache::default(),
@@ -278,8 +277,24 @@ impl RenderPipelineOrchestrator {
     ) -> Result<(), GpuError> {
         let compute = GpuCompute::from_shared(instance, adapter, device, queue, backend)?;
         self.gpu = Some(compute);
+        self.gpu_state = Some(GpuPipelineState::new());
         self.gpu_error = None;
         Ok(())
+    }
+
+    /// Invalidates cached persistent GPU scene/cage residency buffers (call on scene or cage rebind).
+    #[inline]
+    pub fn invalidate_gpu_scene(&mut self) {
+        if let Some(gpu_state) = &mut self.gpu_state {
+            gpu_state.invalidate();
+        }
+        self.sort_cache.invalidate();
+    }
+
+    /// Mutable accessor for the persistent GPU pipeline state, if initialized.
+    #[inline]
+    pub fn gpu_state_mut(&mut self) -> Option<&mut GpuPipelineState> {
+        self.gpu_state.as_mut()
     }
 
     /// Returns the persistent compute client, acquiring it once on first use.
@@ -336,6 +351,9 @@ impl RenderPipelineOrchestrator {
         self.offscreen_height = height;
         // A resize changes the tiling geometry, so any cached sort is invalid.
         self.sort_cache.invalidate();
+        if let Some(gpu_state) = &mut self.gpu_state {
+            gpu_state.invalidate_stage3();
+        }
     }
 
     /// Builds the effective compositor uniforms from the offscreen target size.
@@ -488,312 +506,50 @@ impl RenderPipelineOrchestrator {
         (img, culled_count, rendered_count, active_tiles, computed)
     }
 
-    fn prepare_gpu_sh_coeffs<'a>(
-        scene: &'a GaussianSceneSoa,
-        cages: Option<&CageScene>,
-        sh_degree: u32,
-        split_sources: &[u32],
-    ) -> std::borrow::Cow<'a, [f32]> {
-        let Some(cage_scene) = cages.filter(|c| !c.is_empty()) else {
-            return std::borrow::Cow::Borrowed(&scene.sh_coeffs);
-        };
-        let deg = sh_degree.min(3);
-        if deg == 0 && split_sources.is_empty() {
-            return std::borrow::Cow::Borrowed(&scene.sh_coeffs);
-        }
-
-        let mut rotated = scene.sh_coeffs.clone();
-        if deg > 0 {
-            let deformed = cage_scene.deformed_vertices();
-            let rotators: Vec<Vec<ShRotator>> = cage_scene
-                .cages
-                .iter()
-                .zip(deformed.iter())
-                .map(|(cage, verts)| {
-                    let (_, rots) =
-                        crate::deformation::compute_tet_transforms_cpu(&cage.mesh, verts);
-                    rots.into_iter().map(|r| ShRotator::new(r, deg)).collect()
-                })
-                .collect();
-
-            for (i, binding) in cage_scene.bindings.iter().enumerate() {
-                if !binding.is_bound() {
-                    continue;
-                }
-                if let Some(rotator) = rotators
-                    .get(binding.cage as usize)
-                    .and_then(|tets| tets.get(binding.tet as usize))
-                {
-                    let base = i * 48;
-                    if let Ok(coeffs) = rotated
-                        .get_mut(base..base + 48)
-                        .ok_or(())
-                        .and_then(|s| <&mut [f32; 48]>::try_from(s).map_err(|_| ()))
-                    {
-                        rotator.apply(coeffs);
-                    }
-                }
-            }
-        }
-
-        if !split_sources.is_empty() {
-            rotated.reserve(split_sources.len() * 48);
-            for &src in split_sources {
-                let base = (src as usize) * 48;
-                if base + 48 <= rotated.len() {
-                    rotated.extend_from_within(base..base + 48);
-                } else {
-                    rotated.extend(std::iter::repeat_n(0.0, 48));
-                }
-            }
-        }
-
-        std::borrow::Cow::Owned(rotated)
-    }
-
-    /// Executes the native CubeCL GPU path.
-    ///
-    /// Deformation is applied cage by cage: each pass treats the previous pass's
-    /// output as its "rest" input and only deforms the Gaussians it owns, so
-    /// independent cages compose without a multi-cage kernel.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_gpu(
-        gpu: &GpuCompute,
-        scene: &GaussianSceneSoa,
-        cages: Option<&CageScene>,
-        camera: &CameraUniforms,
-        compositor: &CompositorUniforms,
-        previous_binning: Option<&TileBinningOutputs>,
-        strain_split_threshold: f32,
-        mip_filter_3d_var: f32,
-    ) -> Result<
-        (
-            RasterizedImage,
-            usize,
-            usize,
-            usize,
-            Option<TileBinningOutputs>,
-        ),
-        anyhow::Error,
-    > {
-        let client = gpu.client();
-        let count = scene.count;
-        if count == 0 {
-            return Ok((
-                RasterizedImage::new(
-                    compositor.screen_width,
-                    compositor.screen_height,
-                    compositor.background_color,
-                ),
-                0,
-                0,
-                0,
-                None,
-            ));
-        }
-
-        let mut geometry: Option<DeformedGeometry> = None;
-        let mut cumulative_split_sources: Vec<u32> = Vec::new();
-        let use_adaptive_or_cull = strain_split_threshold > 0.0 || mip_filter_3d_var > 0.0;
-        let mut has_cages = false;
-
-        if let Some(cage_scene) = cages.filter(|c| !c.is_empty()) {
-            let deformed = cage_scene.deformed_vertices();
-            for (cage_index, cage) in cage_scene.cages.iter().enumerate() {
-                if cage.mesh.num_tets() == 0 {
-                    continue;
-                }
-                has_cages = true;
-
-                let current_count = geometry.as_ref().map_or(count, |g| g.opacities.len());
-                let mut bindings: Vec<GaussianBinding> = cage_scene
-                    .bindings
-                    .iter()
-                    .map(|binding| {
-                        if binding.is_bound() && binding.cage as usize == cage_index {
-                            GaussianBinding::new(binding.tet, binding.weights)
-                        } else {
-                            GaussianBinding::unbound()
-                        }
-                    })
-                    .collect();
-                if bindings.len() < current_count {
-                    bindings.resize(current_count, GaussianBinding::unbound());
-                }
-
-                let (positions, covariances, opacities) = match geometry.as_ref() {
-                    Some(previous) => (
-                        previous.positions.as_slice(),
-                        previous.covariances.as_slice(),
-                        previous.opacities.as_slice(),
-                    ),
-                    None => (
-                        scene.positions.as_slice(),
-                        scene.covariances_3d.as_slice(),
-                        scene.opacities.as_slice(),
-                    ),
-                };
-
-                let next_geom = if use_adaptive_or_cull {
-                    deform_geometry_with_splitting_gpu(
-                        client,
-                        positions,
-                        covariances,
-                        opacities,
-                        &cage.mesh,
-                        &bindings,
-                        &deformed[cage_index],
-                        strain_split_threshold,
-                        mip_filter_3d_var,
-                    )?
-                } else {
-                    deform_geometry_gpu(
-                        client,
-                        positions,
-                        covariances,
-                        opacities,
-                        &cage.mesh,
-                        &bindings,
-                        &deformed[cage_index],
-                    )?
-                };
-                if !next_geom.split_source_indices.is_empty() {
-                    for &src in &next_geom.split_source_indices {
-                        let mapped = if (src as usize) < count {
-                            src
-                        } else {
-                            let child_offset = (src as usize) - count;
-                            cumulative_split_sources
-                                .get(child_offset)
-                                .copied()
-                                .unwrap_or(src)
-                        };
-                        cumulative_split_sources.push(mapped);
-                    }
-                }
-                geometry = Some(next_geom);
-            }
-        }
-
-        let (positions, covariances, raw_opacities) = match geometry.as_ref() {
-            Some(deformed) => (
-                deformed.positions.as_slice(),
-                deformed.covariances.as_slice(),
-                deformed.opacities.as_slice(),
-            ),
-            None => (
-                scene.positions.as_slice(),
-                scene.covariances_3d.as_slice(),
-                scene.opacities.as_slice(),
-            ),
-        };
-
-        let (projection, opacities): (
-            crate::render::ProjectionOutputs,
-            std::borrow::Cow<'_, [f32]>,
-        ) = if use_adaptive_or_cull {
-            let culled = project_gaussians_cull_gpu(
-                client,
-                positions,
-                covariances,
-                raw_opacities,
-                camera,
-                if has_cages { 0.0 } else { mip_filter_3d_var },
-                crate::math::MIN_CULL_OPACITY,
-                crate::math::MIN_EFFECTIVE_RADIUS_PX,
-            )?;
-            (culled.projection, std::borrow::Cow::Owned(culled.opacities))
-        } else {
-            (
-                project_gaussians_gpu(client, positions, covariances, camera)?,
-                std::borrow::Cow::Borrowed(raw_opacities),
-            )
-        };
-
-        let culled_count = projection.count.saturating_sub(projection.num_surviving());
-        let rendered_count = projection.num_surviving();
-
-        let computed = if previous_binning.is_none() {
-            if use_adaptive_or_cull {
-                Some(
-                    projection
-                        .bin_and_sort_active(compositor.screen_width, compositor.screen_height),
-                )
-            } else {
-                Some(projection.bin_and_sort(compositor.screen_width, compositor.screen_height))
-            }
-        } else {
-            None
-        };
-        let Some(binning) = previous_binning.or(computed.as_ref()) else {
-            return Ok((
-                RasterizedImage::new(
-                    compositor.screen_width,
-                    compositor.screen_height,
-                    compositor.background_color,
-                ),
-                culled_count,
-                rendered_count,
-                0,
-                None,
-            ));
-        };
-        let active_tiles = binning.non_empty_tiles_count();
-        let sh_coeffs = Self::prepare_gpu_sh_coeffs(
-            scene,
-            cages,
-            compositor.sh_degree,
-            &cumulative_split_sources,
-        );
-
-        let image = composite_gpu(
-            client,
-            &projection,
-            &opacities,
-            &sh_coeffs,
-            positions,
-            binning,
-            compositor,
-        )?;
-
-        Ok((image, culled_count, rendered_count, active_tiles, computed))
-    }
-
-    /// Renders a frame and optionally blits it into a target view.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_frame(
-        &mut self,
-        device: &wgpu::Device,
+    /// Uploads a CPU-backed RGBA8 framebuffer to the offscreen swapchain texture.
+    fn upload_rgba8_to_offscreen(
+        texture: &wgpu::Texture,
         queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
+        rgba8: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_cpu_fallback_frame(
+        &mut self,
+        queue: &wgpu::Queue,
         scene: &GaussianSceneSoa,
         cages: Option<&CageScene>,
+        deformed_vertices: &[Vec<[f32; 3]>],
         camera: &CameraUniforms,
         compositor: &CompositorUniforms,
-        surface_view: Option<&wgpu::TextureView>,
-        show_wireframe: bool,
-        selected: Option<(usize, usize)>,
-    ) -> FrameResult {
-        let width = self.offscreen_width;
-        let height = self.offscreen_height;
-        if width == 0 || height == 0 {
-            return FrameResult {
-                stats: FrameStats::default(),
-                image: RasterizedImage::new(width, height, compositor.background_color),
-            };
-        }
-
-        let compositor = self.effective_compositor(compositor);
-        let camera = camera.with_viewport(width, height);
-
-        self.gpu_pool.update_camera_uniforms(queue, &camera);
-        self.gpu_pool.update_compositor_uniforms(queue, &compositor);
-
-        let deformed_vertices = cages.map(CageScene::deformed_vertices).unwrap_or_default();
-        let cage_state = Self::cage_state(cages, &deformed_vertices);
-        let split_threshold = self.strain_split_threshold;
-        let mip_var = self.mip_filter_3d_var;
-
+        width: u32,
+        height: u32,
+        split_threshold: f32,
+        mip_var: f32,
+    ) -> (FrameStats, RasterizedImage) {
+        let cage_state = Self::cage_state(cages, deformed_vertices);
         let reused_binning = self.sort_cache.take_if_reusable_for_frame(
             &camera.view_matrix,
             &cage_state,
@@ -808,63 +564,18 @@ impl RenderPipelineOrchestrator {
         let previous_ref = reused_binning.as_ref();
         let was_reused = previous_ref.is_some();
 
-        let mut backend_error: Option<String> = None;
-
-        let (image, culled, rendered, active_tiles, computed_binning) = match self.backend {
-            ExecutionBackend::CubeClGpu => {
-                if self.gpu.is_none() && self.gpu_error.is_none() {
-                    let _ = self.compute();
-                }
-                let gpu_result = match self.gpu.as_ref() {
-                    Some(gpu) => Self::execute_gpu(
-                        gpu,
-                        scene,
-                        cages,
-                        &camera,
-                        &compositor,
-                        previous_ref,
-                        split_threshold,
-                        mip_var,
-                    ),
-                    None => {
-                        let message = self
-                            .gpu_error
-                            .clone()
-                            .unwrap_or_else(|| "GPU compute unavailable".to_string());
-                        Err(anyhow::anyhow!(message))
-                    }
-                };
-
-                match gpu_result {
-                    Ok(result) => result,
-                    Err(err) => {
-                        backend_error = Some(err.to_string());
-                        Self::execute_cpu_reference_with_options(
-                            scene,
-                            cages,
-                            &camera,
-                            &compositor,
-                            width,
-                            height,
-                            None,
-                            split_threshold,
-                            mip_var,
-                        )
-                    }
-                }
-            }
-            ExecutionBackend::CpuReference => Self::execute_cpu_reference_with_options(
+        let (image, culled, rendered, active_tiles, computed_binning) =
+            Self::execute_cpu_reference_with_options(
                 scene,
                 cages,
-                &camera,
-                &compositor,
+                camera,
+                compositor,
                 width,
                 height,
                 previous_ref,
                 split_threshold,
                 mip_var,
-            ),
-        };
+            );
 
         let sort_reused = was_reused && computed_binning.is_none();
         let final_binning = computed_binning.or(reused_binning);
@@ -883,31 +594,165 @@ impl RenderPipelineOrchestrator {
             );
         }
 
+        if let Some(texture) = &self.offscreen_texture {
+            Self::upload_rgba8_to_offscreen(texture, queue, &image.rgba8, width, height);
+        }
+
+        let stats = FrameStats {
+            total_gaussians: scene.count,
+            culled_gaussians: culled,
+            rendered_gaussians: rendered,
+            active_tiles,
+            sort_reused,
+        };
+        (stats, image)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame_internal(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+        surface_view: Option<&wgpu::TextureView>,
+        show_wireframe: bool,
+        selected: Option<(usize, usize)>,
+        readback_image: bool,
+    ) -> FrameResult {
+        let width = self.offscreen_width;
+        let height = self.offscreen_height;
+        if width == 0 || height == 0 {
+            return FrameResult {
+                stats: FrameStats::default(),
+                image: RasterizedImage::new(width, height, compositor.background_color),
+            };
+        }
+
+        let compositor = self.effective_compositor(compositor);
+        let camera = camera.with_viewport(width, height);
+
+        self.gpu_pool.update_camera_uniforms(queue, &camera);
+        self.gpu_pool.update_compositor_uniforms(queue, &compositor);
+
+        let deformed_vertices = cages.map(CageScene::deformed_vertices).unwrap_or_default();
+        let split_threshold = self.strain_split_threshold;
+        let mip_var = self.mip_filter_3d_var;
+        let mut backend_error: Option<String> = None;
+
+        let (stats, image) = match self.backend {
+            ExecutionBackend::CubeClGpu => {
+                if self.gpu.is_none() && self.gpu_error.is_none() {
+                    let _ = self.compute();
+                }
+
+                let gpu_outcome: Result<(FrameStats, RasterizedImage), anyhow::Error> =
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        let gpu_state = self.gpu_state.get_or_insert_with(GpuPipelineState::new);
+                        gpu_state
+                            .execute_frame_gpu(
+                                gpu,
+                                scene,
+                                cages,
+                                &camera,
+                                &compositor,
+                                split_threshold,
+                                mip_var,
+                                crate::math::MIN_CULL_OPACITY,
+                                crate::math::MIN_EFFECTIVE_RADIUS_PX,
+                                false,
+                                false,
+                            )
+                            .and_then(|timings| {
+                                let img = if gpu.is_shared_device() {
+                                    if let Some(texture) = self.offscreen_texture.as_ref() {
+                                        gpu_state.copy_framebuffer_to_texture(
+                                            gpu, encoder, texture, width, height,
+                                        )?;
+                                    }
+                                    if readback_image {
+                                        gpu_state.readback_framebuffer(gpu, width, height)?
+                                    } else {
+                                        RasterizedImage {
+                                            width,
+                                            height,
+                                            rgba_f32: Vec::new(),
+                                            rgba8: Vec::new(),
+                                        }
+                                    }
+                                } else {
+                                    let readback =
+                                        gpu_state.readback_framebuffer(gpu, width, height)?;
+                                    if let Some(texture) = self.offscreen_texture.as_ref() {
+                                        Self::upload_rgba8_to_offscreen(
+                                            texture,
+                                            queue,
+                                            &readback.rgba8,
+                                            width,
+                                            height,
+                                        );
+                                    }
+                                    readback
+                                };
+
+                                let stats = FrameStats {
+                                    total_gaussians: scene.count,
+                                    culled_gaussians: timings
+                                        .active_gaussians
+                                        .saturating_sub(timings.surviving_gaussians),
+                                    rendered_gaussians: timings.surviving_gaussians,
+                                    active_tiles: timings.total_tile_entries,
+                                    sort_reused: timings.stage3_cached,
+                                };
+                                Ok((stats, img))
+                            })
+                            .map_err(Into::into)
+                    } else {
+                        let message = self
+                            .gpu_error
+                            .clone()
+                            .unwrap_or_else(|| "GPU compute unavailable".to_string());
+                        Err(anyhow::anyhow!(message))
+                    };
+
+                match gpu_outcome {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        backend_error = Some(err.to_string());
+                        self.execute_cpu_fallback_frame(
+                            queue,
+                            scene,
+                            cages,
+                            &deformed_vertices,
+                            &camera,
+                            &compositor,
+                            width,
+                            height,
+                            split_threshold,
+                            mip_var,
+                        )
+                    }
+                }
+            }
+            ExecutionBackend::CpuReference => self.execute_cpu_fallback_frame(
+                queue,
+                scene,
+                cages,
+                &deformed_vertices,
+                &camera,
+                &compositor,
+                width,
+                height,
+                split_threshold,
+                mip_var,
+            ),
+        };
+
         self.last_backend_error = backend_error;
         self.frames_rendered += 1;
-
-        // Upload the composited image into the offscreen sRGB texture.
-        if let Some(texture) = &self.offscreen_texture {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &image.rgba8,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
 
         if let (Some(view), Some(bind_group)) = (surface_view, &self.blit_bind_group) {
             let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -977,19 +822,41 @@ impl RenderPipelineOrchestrator {
             }
         }
 
-        FrameResult {
-            stats: FrameStats {
-                total_gaussians: scene.count,
-                culled_gaussians: culled,
-                rendered_gaussians: rendered,
-                active_tiles,
-                sort_reused,
-            },
-            image,
-        }
+        FrameResult { stats, image }
     }
 
-    /// Executes the full pipeline for a single frame and returns telemetry only.
+    /// Renders a frame and reads back the composited framebuffer image (for PNG export / parity tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+        surface_view: Option<&wgpu::TextureView>,
+        show_wireframe: bool,
+        selected: Option<(usize, usize)>,
+    ) -> FrameResult {
+        self.render_frame_internal(
+            device,
+            queue,
+            encoder,
+            scene,
+            cages,
+            camera,
+            compositor,
+            surface_view,
+            show_wireframe,
+            selected,
+            true,
+        )
+    }
+
+    /// Executes the full GPU pipeline via zero-copy compute-to-texture blit with no PCIe
+    /// framebuffer readback, returning frame telemetry.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_frame(
         &mut self,
@@ -1004,7 +871,7 @@ impl RenderPipelineOrchestrator {
         show_wireframe: bool,
         selected: Option<(usize, usize)>,
     ) -> FrameStats {
-        self.render_frame(
+        self.render_frame_internal(
             device,
             queue,
             encoder,
@@ -1015,8 +882,166 @@ impl RenderPipelineOrchestrator {
             Some(surface_view),
             show_wireframe,
             selected,
+            false,
         )
         .stats
+    }
+
+    /// Executes the pipeline offscreen via zero-copy blit with no swapchain target view.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_frame_offscreen(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+        show_wireframe: bool,
+        selected: Option<(usize, usize)>,
+    ) -> FrameStats {
+        self.render_frame_internal(
+            device,
+            queue,
+            encoder,
+            scene,
+            cages,
+            camera,
+            compositor,
+            None,
+            show_wireframe,
+            selected,
+            false,
+        )
+        .stats
+    }
+
+    /// Renders an offscreen frame directly to packed tight RGBA8 bytes without offscreen
+    /// texture copies or `f32` framebuffer allocations (fast headless encoding path).
+    pub fn render_frame_rgba8(
+        &mut self,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+    ) -> (FrameStats, Vec<u8>) {
+        let width = self.offscreen_width;
+        let height = self.offscreen_height;
+        if width == 0 || height == 0 {
+            return (FrameStats::default(), Vec::new());
+        }
+
+        let compositor = self.effective_compositor(compositor);
+        let camera = camera.with_viewport(width, height);
+        let split_threshold = self.strain_split_threshold;
+        let mip_var = self.mip_filter_3d_var;
+        let mut backend_error: Option<String> = None;
+
+        let outcome = match self.backend {
+            ExecutionBackend::CubeClGpu => {
+                if self.gpu.is_none() && self.gpu_error.is_none() {
+                    let _ = self.compute();
+                }
+
+                let gpu_result: Result<(FrameStats, Vec<u8>), anyhow::Error> = if let Some(gpu) =
+                    self.gpu.as_ref()
+                {
+                    let gpu_state = self.gpu_state.get_or_insert_with(GpuPipelineState::new);
+                    gpu_state
+                        .execute_frame_gpu(
+                            gpu,
+                            scene,
+                            cages,
+                            &camera,
+                            &compositor,
+                            split_threshold,
+                            mip_var,
+                            crate::math::MIN_CULL_OPACITY,
+                            crate::math::MIN_EFFECTIVE_RADIUS_PX,
+                            false,
+                            false,
+                        )
+                        .and_then(|timings| {
+                            let rgba8 = gpu_state.readback_framebuffer_rgba8(gpu, width, height)?;
+                            let stats = FrameStats {
+                                total_gaussians: scene.count,
+                                culled_gaussians: timings
+                                    .active_gaussians
+                                    .saturating_sub(timings.surviving_gaussians),
+                                rendered_gaussians: timings.surviving_gaussians,
+                                active_tiles: timings.total_tile_entries,
+                                sort_reused: timings.stage3_cached,
+                            };
+                            Ok((stats, rgba8))
+                        })
+                        .map_err(Into::into)
+                } else {
+                    let msg = self
+                        .gpu_error
+                        .clone()
+                        .unwrap_or_else(|| "GPU compute unavailable".to_string());
+                    Err(anyhow::anyhow!(msg))
+                };
+
+                match gpu_result {
+                    Ok(res) => res,
+                    Err(err) => {
+                        backend_error = Some(err.to_string());
+                        let (img, culled, rendered, active_tiles, _) =
+                            Self::execute_cpu_reference_with_options(
+                                scene,
+                                cages,
+                                &camera,
+                                &compositor,
+                                width,
+                                height,
+                                None,
+                                split_threshold,
+                                mip_var,
+                            );
+                        (
+                            FrameStats {
+                                total_gaussians: scene.count,
+                                culled_gaussians: culled,
+                                rendered_gaussians: rendered,
+                                active_tiles,
+                                sort_reused: false,
+                            },
+                            img.rgba8,
+                        )
+                    }
+                }
+            }
+            ExecutionBackend::CpuReference => {
+                let (img, culled, rendered, active_tiles, _) =
+                    Self::execute_cpu_reference_with_options(
+                        scene,
+                        cages,
+                        &camera,
+                        &compositor,
+                        width,
+                        height,
+                        None,
+                        split_threshold,
+                        mip_var,
+                    );
+                (
+                    FrameStats {
+                        total_gaussians: scene.count,
+                        culled_gaussians: culled,
+                        rendered_gaussians: rendered,
+                        active_tiles,
+                        sort_reused: false,
+                    },
+                    img.rgba8,
+                )
+            }
+        };
+
+        self.last_backend_error = backend_error;
+        self.frames_rendered += 1;
+        outcome
     }
 }
 

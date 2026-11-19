@@ -3,7 +3,9 @@
 use crate::deformation::CageScene;
 use crate::render::blit::OFFSCREEN_FORMAT;
 use crate::render::camera::CameraUniforms;
-use crate::render::pipeline::{ExecutionBackend, FrameResult, RenderPipelineOrchestrator};
+use crate::render::pipeline::{
+    ExecutionBackend, FrameResult, FrameStats, RenderPipelineOrchestrator,
+};
 use crate::render::rasterizer::CompositorUniforms;
 use crate::scene::GaussianSceneSoa;
 
@@ -28,9 +30,10 @@ impl HeadlessRenderer {
 
         let info = adapter.get_info();
         let limits = adapter.limits();
+        let features = crate::render::gpu::preferred_wgpu_features(&adapter);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("CinderGSHeadlessDevice"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -153,5 +156,57 @@ impl HeadlessRenderer {
             .map_err(|err| anyhow::anyhow!("WGPU poll failed: {err}"))?;
 
         Ok(result)
+    }
+
+    /// Renders one frame entirely offscreen via zero-copy compute-to-texture blit with
+    /// no PCIe framebuffer readback, returning frame telemetry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_zero_copy(
+        &mut self,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+        show_wireframe: bool,
+        selected: Option<(usize, usize)>,
+    ) -> anyhow::Result<FrameStats> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("HeadlessZeroCopyFrameEncoder"),
+            });
+
+        let stats = self.orchestrator.execute_frame_offscreen(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            scene,
+            cages,
+            camera,
+            compositor,
+            show_wireframe,
+            selected,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| anyhow::anyhow!("WGPU poll failed: {err}"))?;
+
+        Ok(stats)
+    }
+
+    /// Renders one frame offscreen and returns telemetry + tight RGBA8 pixel bytes
+    /// without swapchain texture copies or intermediate `f32` conversions.
+    pub fn render_rgba8(
+        &mut self,
+        scene: &GaussianSceneSoa,
+        cages: Option<&CageScene>,
+        camera: &CameraUniforms,
+        compositor: &CompositorUniforms,
+    ) -> anyhow::Result<(FrameStats, Vec<u8>)> {
+        Ok(self
+            .orchestrator
+            .render_frame_rgba8(scene, cages, camera, compositor))
     }
 }
