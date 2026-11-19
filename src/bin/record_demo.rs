@@ -22,9 +22,14 @@ use cinder_gs::scene::autoframe::compute_scene_framing;
 use cinder_gs::scene::fibonacci_cluster;
 use cinder_gs::scene::{GaussianSceneSoa, PlyLoader};
 use glam::Vec3;
-use std::fs;
+use image::ImageEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 
 const DEFAULT_WIDTH: u32 = 960;
@@ -43,6 +48,7 @@ struct DemoOptions {
     frames: u32,
     fps: u32,
     no_encode: bool,
+    save_frames: bool,
 }
 
 impl Default for DemoOptions {
@@ -58,6 +64,7 @@ impl Default for DemoOptions {
             frames: DEFAULT_FRAMES,
             fps: DEFAULT_FPS,
             no_encode: false,
+            save_frames: false,
         }
     }
 }
@@ -116,6 +123,7 @@ fn parse_options() -> Result<DemoOptions> {
             "--frames" => options.frames = take_value("--frames")?.parse()?,
             "--fps" => options.fps = take_value("--fps")?.parse()?,
             "--no-encode" => options.no_encode = true,
+            "--save-frames" => options.save_frames = true,
             "--help" | "-h" => {
                 println!(
                     "CinderGS demo recorder\n\
@@ -126,6 +134,7 @@ fn parse_options() -> Result<DemoOptions> {
                      --bounds minx,miny,minz,maxx,maxy,maxz  cage bounds override\n\
                      --width/--height <px>     output resolution\n\
                      --frames <n> --fps <n>    timing\n\
+                     --save-frames             also write PNG frames to --out instead of direct pipe\n\
                      --no-encode               keep PNGs only, skip MP4/GIF"
                 );
                 std::process::exit(0);
@@ -164,14 +173,45 @@ fn load_scene(input: &Option<PathBuf>) -> Result<GaussianSceneSoa> {
     Ok(fibonacci_cluster(100_000, 1.2, [0.0, 0.0, 2.5]))
 }
 
-fn encode_with_ffmpeg(frames: &std::path::Path, docs: &std::path::Path, fps: u32) -> Result<()> {
-    let available = Command::new("ffmpeg")
+fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
         .arg("-version")
         .output()
         .map(|output| output.status.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !available {
+fn dual_output_filter_complex() -> &'static str {
+    "[0:v]split=2[mp4_in][gif_in];\
+     [mp4_in]scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[mp4_out];\
+     [gif_in]fps=20,scale=800:-1:flags=lanczos,format=rgb24,split[s0][s1];\
+     [s0]palettegen=max_colors=256:stats_mode=full[p];\
+     [s1][p]paletteuse=dither=bayer:bayer_scale=5[gif_out]"
+}
+
+fn save_fast_png(path: &std::path::Path, rgba8: &[u8], width: u32, height: u32) -> Result<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::with_capacity(64 * 1024, file);
+    let encoder = PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub);
+    encoder.write_image(rgba8, width, height, image::ExtendedColorType::Rgba8)?;
+    Ok(())
+}
+
+fn report_encoded_outputs(docs: &std::path::Path) {
+    for name in ["cindergs_demo.mp4", "cindergs_demo.gif"] {
+        let path = docs.join(name);
+        if let Ok(metadata) = fs::metadata(&path) {
+            println!(
+                "Wrote {} ({:.2} MB)",
+                path.display(),
+                metadata.len() as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+}
+
+fn encode_with_ffmpeg(frames: &std::path::Path, docs: &std::path::Path, fps: u32) -> Result<()> {
+    if !ffmpeg_available() {
         println!(
             "ffmpeg not found; PNG frames remain in {}",
             frames.display()
@@ -184,60 +224,171 @@ fn encode_with_ffmpeg(frames: &std::path::Path, docs: &std::path::Path, fps: u32
         .to_str()
         .ok_or_else(|| anyhow!("frame path is not valid UTF-8"))?;
     let rate = fps.to_string();
-
     let mp4 = docs.join("cindergs_demo.mp4");
-    let mp4_status = Command::new("ffmpeg")
+    let gif = docs.join("cindergs_demo.gif");
+
+    let status = Command::new("ffmpeg")
         .args([
             "-y",
+            "-threads",
+            "0",
             "-framerate",
             &rate,
             "-i",
             pattern,
+            "-filter_complex",
+            dual_output_filter_complex(),
+            "-map",
+            "[mp4_out]",
             "-c:v",
             "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            "-preset",
+            "fast",
             "-crf",
             "18",
+            "-movflags",
+            "+faststart",
         ])
         .arg(&mp4)
-        .status();
-
-    match mp4_status {
-        Ok(status) if status.success() => println!("Wrote {}", mp4.display()),
-        Ok(status) => eprintln!("warning: ffmpeg MP4 encoding failed ({status})"),
-        Err(err) => eprintln!("warning: could not run ffmpeg: {err}"),
-    }
-
-    let gif = docs.join("cindergs_demo.gif");
-    let gif_status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-framerate",
-            &rate,
-            "-i",
-            pattern,
-            "-vf",
-            "fps=20,format=rgb24,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
-        ])
+        .args(["-map", "[gif_out]"])
         .arg(&gif)
-        .status();
+        .status()?;
 
-    match gif_status {
-        Ok(status) if status.success() => {
-            if let Ok(metadata) = fs::metadata(&gif) {
-                println!(
-                    "Wrote {} ({:.2} MB)",
-                    gif.display(),
-                    metadata.len() as f64 / (1024.0 * 1024.0)
-                );
-            }
-        }
-        Ok(status) => eprintln!("warning: ffmpeg GIF encoding failed ({status})"),
-        Err(err) => eprintln!("warning: could not run ffmpeg: {err}"),
+    if status.success() {
+        report_encoded_outputs(docs);
+    } else {
+        eprintln!("warning: single-pass ffmpeg MP4/GIF encoding failed ({status})");
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_demo_frame(
+    frame_index: u32,
+    total_frames: u32,
+    fps: u32,
+    width: u32,
+    height: u32,
+    camera: &mut cinder_gs::app::OrbitCamera,
+    cages: &mut CageScene,
+    top_indices: &[usize],
+    base_indices: &[usize],
+    top_center: Vec3,
+) -> (CameraUniforms, Vec3) {
+    let progress = frame_index as f32 / total_frames as f32;
+    camera.yaw = -0.55 + progress * 0.70;
+
+    let view = camera.view_matrix();
+    let cam_right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x).normalize_or_zero();
+
+    match frame_index {
+        0..=44 => {
+            if let Some(cage) = cages.cages.first_mut() {
+                cage.simulator.reset();
+            }
+        }
+        45..=89 => {
+            let t = (frame_index - 45) as f32 / 45.0;
+            let lean = (t * std::f32::consts::FRAC_PI_2).sin() * 0.10;
+            let bloom = (t * std::f32::consts::FRAC_PI_2).sin() * 0.03;
+            if let Some(cage) = cages.cages.first_mut() {
+                cage.simulator.reset();
+                for &top in top_indices {
+                    let radial = cage.simulator.rest_positions[top] - top_center;
+                    cage.simulator.current_positions[top] =
+                        cage.simulator.rest_positions[top] + cam_right * lean + radial * bloom;
+                }
+            }
+        }
+        _ => {
+            if frame_index == 90
+                && let Some(cage) = cages.cages.first_mut()
+            {
+                for &top in top_indices {
+                    let radial = cage.simulator.rest_positions[top] - top_center;
+                    cage.simulator.current_positions[top] =
+                        cage.simulator.rest_positions[top] + cam_right * 0.10 + radial * 0.03;
+                    cage.simulator.velocities[top] = cam_right * 1.0 + radial * 1.5;
+                }
+                for &base in base_indices {
+                    cage.simulator.current_positions[base] = cage.simulator.rest_positions[base];
+                    cage.simulator.velocities[base] = Vec3::ZERO;
+                }
+            }
+
+            cages.step(1.0 / fps as f32);
+
+            if let Some(cage) = cages.cages.first_mut() {
+                for &base in base_indices {
+                    cage.simulator.current_positions[base] = cage.simulator.rest_positions[base];
+                    cage.simulator.velocities[base] = Vec3::ZERO;
+                }
+            }
+        }
+    }
+
+    let eye = camera.eye_position();
+    let cam = CameraUniforms::from_look_at(
+        eye,
+        camera.target,
+        Vec3::Y,
+        camera.fov_y,
+        width as f32,
+        height as f32,
+        camera.near_plane,
+    );
+    (cam, eye)
+}
+
+fn spawn_piped_ffmpeg(
+    docs: &std::path::Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<std::process::Child> {
+    let mp4 = docs.join("cindergs_demo.mp4");
+    let gif = docs.join("cindergs_demo.gif");
+    let dims = format!("{width}x{height}");
+    let rate = fps.to_string();
+
+    let child = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-threads",
+            "0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &dims,
+            "-r",
+            &rate,
+            "-i",
+            "pipe:0",
+            "-filter_complex",
+            dual_output_filter_complex(),
+            "-map",
+            "[mp4_out]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&mp4)
+        .args(["-map", "[gif_out]"])
+        .arg(&gif)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    Ok(child)
 }
 
 fn main() -> Result<()> {
@@ -307,9 +458,6 @@ fn main() -> Result<()> {
         .filter(|(_, score)| **score >= highest - tolerance)
         .map(|(index, _)| index)
         .collect();
-    let top_handle = *top_indices
-        .first()
-        .ok_or_else(|| anyhow!("cage has no top vertex"))?;
     let base_indices: Vec<usize> = up_scores
         .iter()
         .enumerate()
@@ -335,7 +483,7 @@ fn main() -> Result<()> {
         println!("Compute device: {description}");
     }
 
-    let compositor = CompositorUniforms::new(
+    let mut compositor = CompositorUniforms::new(
         options.width,
         options.height,
         [0.05, 0.05, 0.08, 1.0],
@@ -347,133 +495,183 @@ fn main() -> Result<()> {
     // Gentle low-angle hero orbit, matching the original demo framing.
     camera.pitch = -0.32;
 
+    let use_piped_ffmpeg = !options.no_encode && !options.save_frames && ffmpeg_available();
     println!(
-        "Rendering {} frames at {}x{} @ {} FPS...",
-        options.frames, options.width, options.height, options.fps
+        "Rendering {} frames at {}x{} @ {} FPS ({})...",
+        options.frames,
+        options.width,
+        options.height,
+        options.fps,
+        if use_piped_ffmpeg {
+            "direct raw pipe -> single-pass MP4/GIF"
+        } else {
+            "fast PNG frames"
+        }
     );
+
     let record_start = Instant::now();
 
-    for frame_index in 0..options.frames {
-        let frame_start = Instant::now();
-        let progress = frame_index as f32 / options.frames as f32;
-        camera.yaw = -0.55 + progress * 0.70;
-
-        let view = camera.view_matrix();
-        let cam_right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x).normalize_or_zero();
-
-        let mut selected = None;
-
-        match frame_index {
-            0..=44 => {
-                // Phase 1: orbit showcase at rest.
-                if let Some(cage) = cages.cages.first_mut() {
-                    cage.simulator.reset();
-                }
+    if use_piped_ffmpeg {
+        let mut child = spawn_piped_ffmpeg(&docs_dir, options.width, options.height, options.fps)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open ffmpeg stdin pipe"))?;
+        let frame_bytes = (options.width as usize) * (options.height as usize) * 4;
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        let writer_handle = thread::spawn(move || -> Result<()> {
+            let mut buffered = BufWriter::with_capacity(frame_bytes.max(65_536), &mut stdin);
+            for bytes in rx {
+                buffered.write_all(&bytes)?;
             }
-            45..=89 => {
-                // Phase 2: the whole crown leans and puffs slightly. Moving the
-                // full top ring keeps the deformation coherent across tetrahedra,
-                // so the tree bends instead of splitting at a seam.
-                let t = (frame_index - 45) as f32 / 45.0;
-                let lean = (t * std::f32::consts::FRAC_PI_2).sin() * 0.10;
-                let bloom = (t * std::f32::consts::FRAC_PI_2).sin() * 0.03;
-                if let Some(cage) = cages.cages.first_mut() {
-                    cage.simulator.reset();
-                    for &top in &top_indices {
-                        let radial = cage.simulator.rest_positions[top] - top_center;
-                        cage.simulator.current_positions[top] =
-                            cage.simulator.rest_positions[top] + cam_right * lean + radial * bloom;
+            buffered.flush()?;
+            Ok(())
+        });
+
+        let mut render_err: Option<anyhow::Error> = None;
+        for frame_index in 0..options.frames {
+            let frame_start = Instant::now();
+            let (camera_uniforms, eye) = step_demo_frame(
+                frame_index,
+                options.frames,
+                options.fps,
+                options.width,
+                options.height,
+                &mut camera,
+                &mut cages,
+                &top_indices,
+                &base_indices,
+                top_center,
+            );
+            compositor.camera_position = eye.into();
+
+            match renderer.render_rgba8(&scene, Some(&cages), &camera_uniforms, &compositor) {
+                Ok((stats, rgba8)) => {
+                    if frame_index % 15 == 0 || frame_index + 1 == options.frames {
+                        println!(
+                            "Frame [{:3}/{}] {:6.2} ms | splats {} | entries {} | {}",
+                            frame_index + 1,
+                            options.frames,
+                            frame_start.elapsed().as_secs_f64() * 1000.0,
+                            stats.rendered_gaussians,
+                            stats.active_tiles,
+                            if stats.sort_reused {
+                                "sort cached"
+                            } else {
+                                "gpu sorted"
+                            }
+                        );
+                    }
+                    if tx.send(rgba8).is_err() {
+                        render_err = Some(anyhow!("ffmpeg stdin pipe closed unexpectedly"));
+                        break;
                     }
                 }
-                selected = Some((0, top_handle));
-            }
-            _ => {
-                // Phase 3: release with a gentle outward impulse so the foliage
-                // ruffles and settles instead of snapping back as a rigid block.
-                if frame_index == 90
-                    && let Some(cage) = cages.cages.first_mut()
-                {
-                    for &top in &top_indices {
-                        let radial = cage.simulator.rest_positions[top] - top_center;
-                        cage.simulator.current_positions[top] =
-                            cage.simulator.rest_positions[top] + cam_right * 0.10 + radial * 0.03;
-                        cage.simulator.velocities[top] = cam_right * 1.0 + radial * 1.5;
-                    }
-                    for &base in &base_indices {
-                        cage.simulator.current_positions[base] =
-                            cage.simulator.rest_positions[base];
-                        cage.simulator.velocities[base] = Vec3::ZERO;
-                    }
-                }
-
-                cages.step(1.0 / options.fps as f32);
-
-                if let Some(cage) = cages.cages.first_mut() {
-                    for &base in &base_indices {
-                        cage.simulator.current_positions[base] =
-                            cage.simulator.rest_positions[base];
-                        cage.simulator.velocities[base] = Vec3::ZERO;
-                    }
+                Err(err) => {
+                    render_err = Some(err);
+                    break;
                 }
             }
         }
 
-        let camera_uniforms = CameraUniforms::from_look_at(
-            camera.eye_position(),
-            camera.target,
-            Vec3::Y,
-            camera.fov_y,
-            options.width as f32,
-            options.height as f32,
-            camera.near_plane,
-        );
-
-        let result = renderer.render(
-            &scene,
-            Some(&cages),
-            &camera_uniforms,
-            &compositor,
-            true,
-            selected,
-        )?;
-
-        let frame_path = options.output.join(format!("frame_{frame_index:04}.png"));
-        image::save_buffer(
-            &frame_path,
-            &result.image.rgba8,
-            result.image.width,
-            result.image.height,
-            image::ExtendedColorType::Rgba8,
-        )?;
-
-        if frame_index % 10 == 0 || frame_index + 1 == options.frames {
-            println!(
-                "Frame [{:3}/{}] {:6.2} ms | splats {} | tiles {} | {}",
-                frame_index + 1,
-                options.frames,
-                frame_start.elapsed().as_secs_f64() * 1000.0,
-                result.stats.rendered_gaussians,
-                result.stats.active_tiles,
-                if result.stats.sort_reused {
-                    "sort reused"
-                } else {
-                    "sort recomputed"
+        drop(tx);
+        let write_res = writer_handle
+            .join()
+            .map_err(|_| anyhow!("ffmpeg writer thread panicked"))?;
+        let status = child.wait()?;
+        if let Some(err) = render_err {
+            return Err(err);
+        }
+        write_res?;
+        if !status.success() {
+            return Err(anyhow!("ffmpeg exited with status {status}"));
+        }
+        report_encoded_outputs(&docs_dir);
+    } else {
+        let workers = thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(2);
+        let (tx, rx) = mpsc::sync_channel::<(PathBuf, Vec<u8>)>(workers * 2);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut handles = Vec::with_capacity(workers);
+        let w = options.width;
+        let h = options.height;
+        for _ in 0..workers {
+            let rx_worker = Arc::clone(&rx);
+            handles.push(thread::spawn(move || -> Result<()> {
+                loop {
+                    let item = {
+                        let guard = rx_worker
+                            .lock()
+                            .map_err(|_| anyhow!("PNG worker lock poisoned"))?;
+                        guard.recv()
+                    };
+                    match item {
+                        Ok((path, rgba8)) => save_fast_png(&path, &rgba8, w, h)?,
+                        Err(_) => break,
+                    }
                 }
+                Ok(())
+            }));
+        }
+
+        for frame_index in 0..options.frames {
+            let frame_start = Instant::now();
+            let (camera_uniforms, eye) = step_demo_frame(
+                frame_index,
+                options.frames,
+                options.fps,
+                options.width,
+                options.height,
+                &mut camera,
+                &mut cages,
+                &top_indices,
+                &base_indices,
+                top_center,
             );
+            compositor.camera_position = eye.into();
+
+            let (stats, rgba8) =
+                renderer.render_rgba8(&scene, Some(&cages), &camera_uniforms, &compositor)?;
+            let frame_path = options.output.join(format!("frame_{frame_index:04}.png"));
+            tx.send((frame_path, rgba8))
+                .map_err(|_| anyhow!("PNG worker channel closed unexpectedly"))?;
+
+            if frame_index % 15 == 0 || frame_index + 1 == options.frames {
+                println!(
+                    "Frame [{:3}/{}] {:6.2} ms | splats {} | entries {} | {}",
+                    frame_index + 1,
+                    options.frames,
+                    frame_start.elapsed().as_secs_f64() * 1000.0,
+                    stats.rendered_gaussians,
+                    stats.active_tiles,
+                    if stats.sort_reused {
+                        "sort cached"
+                    } else {
+                        "gpu sorted"
+                    }
+                );
+            }
+        }
+
+        drop(tx);
+        for h in handles {
+            h.join()
+                .map_err(|_| anyhow!("PNG worker thread panicked"))??;
+        }
+
+        if !options.no_encode {
+            encode_with_ffmpeg(&options.output, &docs_dir, options.fps)?;
         }
     }
 
     let elapsed = record_start.elapsed();
     println!(
-        "\nRendered {} frames in {:.2}s ({:.2} ms/frame)",
+        "\nCompleted {} frames in {:.2}s ({:.2} ms/frame incl. encode)",
         options.frames,
         elapsed.as_secs_f64(),
         elapsed.as_secs_f64() * 1000.0 / options.frames as f64
     );
-
-    if !options.no_encode {
-        encode_with_ffmpeg(&options.output, &docs_dir, options.fps)?;
-    }
     println!("\nDemo recording complete.");
     Ok(())
 }
