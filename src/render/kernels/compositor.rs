@@ -310,19 +310,7 @@ pub fn tile_compositor_kernel(
 
 #[cube]
 fn unpack_f16_comp(bits: u32) -> f32 {
-    let h = bits & 0xFFFFu32;
-    let sign_bit = (h >> 15u32) & 1u32;
-    let exp = (h >> 10u32) & 0x1Fu32;
-    let mant = h & 0x3FFu32;
-    let sign = if sign_bit == 1u32 { -1.0f32 } else { 1.0f32 };
-
-    if exp == 0u32 {
-        sign * (mant as f32) * 5.9604645e-8f32
-    } else if exp == 31u32 {
-        sign * 65504.0f32
-    } else {
-        sign * (1.0f32 + (mant as f32) * 0.0009765625f32) * f32::powf(2.0f32, exp as f32 - 15.0f32)
-    }
+    crate::render::kernels::project::unpack_f16(bits)
 }
 
 #[cube]
@@ -703,6 +691,375 @@ pub fn tile_compositor_quantized_kernel(
         sync_cube();
 
         if active_threads[0usize] == 0u32 {
+            break;
+        }
+    }
+
+    if inside_screen {
+        let final_r = f32::clamp(c_r + t * bg_r, 0.0f32, 1.0f32);
+        let final_g = f32::clamp(c_g + t * bg_g, 0.0f32, 1.0f32);
+        let final_b = f32::clamp(c_b + t * bg_b, 0.0f32, 1.0f32);
+        let mut final_a = f32::clamp(1.0f32 - t, 0.0f32, 1.0f32);
+        if is_empty {
+            final_a = bg_a;
+        }
+
+        let out_base = (py * screen_width + px) as usize * 4usize;
+        output_pixels[out_base] = final_r;
+        output_pixels[out_base + 1usize] = final_g;
+        output_pixels[out_base + 2usize] = final_b;
+        output_pixels[out_base + 3usize] = final_a;
+    }
+}
+
+/// High-throughput Stage 4 tile compositor reading pre-evaluated Stage 2 view-dependent RGB
+/// (`splat_attrs` = 10 floats/splat) and flat `sorted_splat_ids`, packing quantized RGBA8 directly
+/// into `u32` rows aligned to `padded_row_u32` (zero-copy WGPU texture transfer ready).
+///
+/// Uses double-buffered shared `Atomic<u32>` early tile termination (with subgroup `plane_any`
+/// ballot coalescing when `use_subgroups` is true).
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::manual_div_ceil,
+    clippy::too_many_arguments
+)]
+#[cube(launch)]
+pub fn tile_compositor_v2_kernel(
+    splat_attrs: &[f32],
+    sorted_splat_ids: &[u32],
+    tile_ranges: &[u32],
+    output_rgba8: &mut [u32],
+    screen_width: u32,
+    screen_height: u32,
+    tiles_x: u32,
+    padded_row_u32: u32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
+    #[comptime] use_subgroups: bool,
+) {
+    let tx = CUBE_POS_X;
+    let ty = CUBE_POS_Y;
+    let local_id = UNIT_POS;
+    let local_id_u32 = local_id as u32;
+
+    let lx = local_id_u32 % 16u32;
+    let ly = local_id_u32 / 16u32;
+    let px = tx * 16u32 + lx;
+    let py = ty * 16u32 + ly;
+    let inside_screen = px < screen_width && py < screen_height;
+
+    let tile_id = ty * tiles_x + tx;
+    let range_start = tile_ranges[tile_id as usize * 2usize];
+    let range_end = tile_ranges[tile_id as usize * 2usize + 1usize];
+    let is_empty = range_start >= range_end;
+
+    let mut shared_xy_x = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_xy_y = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_a = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_b = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_c = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_opacity = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_r = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_g = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_b = Shared::<[f32]>::new_slice(256usize);
+    let tile_alive = Shared::<[Atomic<u32>]>::new_slice(2usize);
+
+    if local_id_u32 < 2u32 {
+        tile_alive[local_id as usize].store(0u32);
+    }
+    sync_cube();
+
+    let mut c_r = 0.0f32;
+    let mut c_g = 0.0f32;
+    let mut c_b = 0.0f32;
+    let mut t = 1.0f32;
+    let mut saturated = false;
+
+    let total_in_tile = if is_empty {
+        0u32
+    } else {
+        range_end - range_start
+    };
+    let num_batches = (total_in_tile + 255u32) / 256u32;
+
+    let pix_center_x = px as f32 + 0.5f32;
+    let pix_center_y = py as f32 + 0.5f32;
+
+    for b in 0u32..num_batches {
+        let entry_idx = range_start + b * 256u32 + local_id_u32;
+        if entry_idx < range_end {
+            let g = sorted_splat_ids[entry_idx as usize] as usize;
+            let attr_base = g * 10usize;
+            shared_xy_x[local_id as usize] = splat_attrs[attr_base];
+            shared_xy_y[local_id as usize] = splat_attrs[attr_base + 1usize];
+            shared_conic_a[local_id as usize] = splat_attrs[attr_base + 2usize];
+            shared_conic_b[local_id as usize] = splat_attrs[attr_base + 3usize];
+            shared_conic_c[local_id as usize] = splat_attrs[attr_base + 4usize];
+            shared_opacity[local_id as usize] = splat_attrs[attr_base + 5usize];
+            shared_rgb_r[local_id as usize] = splat_attrs[attr_base + 6usize];
+            shared_rgb_g[local_id as usize] = splat_attrs[attr_base + 7usize];
+            shared_rgb_b[local_id as usize] = splat_attrs[attr_base + 8usize];
+        } else {
+            shared_opacity[local_id as usize] = 0.0f32;
+        }
+        sync_cube();
+
+        let slot = (b & 1u32) as usize;
+        let next_slot = ((b + 1u32) & 1u32) as usize;
+        if local_id_u32 == 0u32 {
+            tile_alive[next_slot].store(0u32);
+        }
+
+        let batch_count = u32::min(256u32, total_in_tile - b * 256u32);
+        if inside_screen && !saturated {
+            for k in 0u32..batch_count {
+                let op_base = shared_opacity[k as usize];
+                if op_base > 0.003921569f32 {
+                    let mu_x = shared_xy_x[k as usize];
+                    let mu_y = shared_xy_y[k as usize];
+                    let dx = pix_center_x - mu_x;
+                    let dy = pix_center_y - mu_y;
+                    let a = shared_conic_a[k as usize];
+                    let b_coef = shared_conic_b[k as usize];
+                    let c = shared_conic_c[k as usize];
+
+                    let mut q = -0.5f32 * (a * dx * dx + 2.0f32 * b_coef * dx * dy + c * dy * dy);
+                    if q > 0.0f32 {
+                        q = 0.0f32;
+                    }
+                    if q >= -4.0f32 {
+                        let alpha = f32::min(0.99f32, op_base * f32::exp(q));
+                        if alpha >= 0.003921569f32 {
+                            let w = alpha * t;
+                            c_r += w * shared_rgb_r[k as usize];
+                            c_g += w * shared_rgb_g[k as usize];
+                            c_b += w * shared_rgb_b[k as usize];
+                            t *= 1.0f32 - alpha;
+                            if t < 0.001f32 {
+                                saturated = true;
+                                t = 0.0f32;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_alive = inside_screen && !saturated;
+        if comptime!(use_subgroups) {
+            let lane_any = plane_any(is_alive);
+            if lane_any && UNIT_POS_PLANE == 0u32 {
+                tile_alive[slot].store(1u32);
+            }
+        } else if is_alive {
+            tile_alive[slot].store(1u32);
+        }
+        sync_cube();
+
+        if tile_alive[slot].load() == 0u32 {
+            break;
+        }
+    }
+
+    if inside_screen {
+        let final_r = f32::clamp(c_r + t * bg_r, 0.0f32, 1.0f32);
+        let final_g = f32::clamp(c_g + t * bg_g, 0.0f32, 1.0f32);
+        let final_b = f32::clamp(c_b + t * bg_b, 0.0f32, 1.0f32);
+        let mut final_a = f32::clamp(1.0f32 - t, 0.0f32, 1.0f32);
+        if is_empty {
+            final_a = bg_a;
+        }
+
+        let r8 = f32::clamp(f32::round(final_r * 255.0f32), 0.0f32, 255.0f32) as u32;
+        let g8 = f32::clamp(f32::round(final_g * 255.0f32), 0.0f32, 255.0f32) as u32;
+        let b8 = f32::clamp(f32::round(final_b * 255.0f32), 0.0f32, 255.0f32) as u32;
+        let a8 = f32::clamp(f32::round(final_a * 255.0f32), 0.0f32, 255.0f32) as u32;
+        output_rgba8[(py * padded_row_u32 + px) as usize] =
+            r8 | (g8 << 8u32) | (b8 << 16u32) | (a8 << 24u32);
+    }
+}
+
+/// Native `half::f16` SH variant of [`tile_compositor_quantized_kernel`] when
+/// `SHADER_F16` is available on the adapter.
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::manual_div_ceil,
+    clippy::too_many_arguments
+)]
+#[cube(launch)]
+pub fn tile_compositor_quantized_f16_kernel(
+    points_xy: &[f32],
+    conics: &[f32],
+    opacities: &[f32],
+    sh_coeffs_f16: &[half::f16],
+    positions_3d: &[f32],
+    sorted_entries: &[u32],
+    tile_ranges: &[u32],
+    output_pixels: &mut [f32],
+    screen_width: u32,
+    screen_height: u32,
+    tiles_x: u32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
+    cam_pos_x: f32,
+    cam_pos_y: f32,
+    cam_pos_z: f32,
+    sh_degree: u32,
+) {
+    let tx = CUBE_POS_X;
+    let ty = CUBE_POS_Y;
+    let local_id = UNIT_POS;
+    let local_id_u32 = local_id as u32;
+
+    let lx = local_id_u32 % 16u32;
+    let ly = local_id_u32 / 16u32;
+
+    let px = tx * 16u32 + lx;
+    let py = ty * 16u32 + ly;
+    let inside_screen = px < screen_width && py < screen_height;
+
+    let tile_id = ty * tiles_x + tx;
+    let range_start = tile_ranges[tile_id as usize * 2usize];
+    let range_end = tile_ranges[tile_id as usize * 2usize + 1usize];
+    let is_empty = range_start >= range_end;
+
+    let bases_per_ch = if sh_degree == 0u32 {
+        1usize
+    } else if sh_degree == 1u32 {
+        4usize
+    } else if sh_degree == 2u32 {
+        9usize
+    } else {
+        16usize
+    };
+    let sh_f16_stride = ((bases_per_ch * 3usize + 1usize) / 2usize) * 2usize;
+
+    let mut shared_xy_x = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_xy_y = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_a = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_b = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_conic_c = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_opacity = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_r = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_g = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_rgb_b = Shared::<[f32]>::new_slice(256usize);
+    let tile_alive = Shared::<[Atomic<u32>]>::new_slice(2usize);
+
+    if local_id_u32 < 2u32 {
+        tile_alive[local_id as usize].store(0u32);
+    }
+    sync_cube();
+
+    let mut c_r = 0.0f32;
+    let mut c_g = 0.0f32;
+    let mut c_b = 0.0f32;
+    let mut t = 1.0f32;
+    let mut saturated = false;
+
+    let total_in_tile = if is_empty {
+        0u32
+    } else {
+        range_end - range_start
+    };
+    let num_batches = (total_in_tile + 255u32) / 256u32;
+
+    let pix_center_x = px as f32 + 0.5f32;
+    let pix_center_y = py as f32 + 0.5f32;
+
+    for b in 0u32..num_batches {
+        let entry_idx = range_start + b * 256u32 + local_id_u32;
+        if entry_idx < range_end {
+            let g = sorted_entries[entry_idx as usize * 3usize + 2usize] as usize;
+            shared_xy_x[local_id as usize] = points_xy[g * 2usize];
+            shared_xy_y[local_id as usize] = points_xy[g * 2usize + 1usize];
+            shared_conic_a[local_id as usize] = conics[g * 3usize];
+            shared_conic_b[local_id as usize] = conics[g * 3usize + 1usize];
+            shared_conic_c[local_id as usize] = conics[g * 3usize + 2usize];
+            shared_opacity[local_id as usize] = opacities[g];
+
+            let pos_x = positions_3d[g * 3usize];
+            let pos_y = positions_3d[g * 3usize + 1usize];
+            let pos_z = positions_3d[g * 3usize + 2usize];
+
+            let vx = pos_x - cam_pos_x;
+            let vy = pos_y - cam_pos_y;
+            let vz = pos_z - cam_pos_z;
+            let dist_sq = vx * vx + vy * vy + vz * vz;
+            let inv_len = 1.0f32 / f32::max(0.0001f32, f32::sqrt(dist_sq));
+            let dir_x = vx * inv_len;
+            let dir_y = vy * inv_len;
+            let dir_z = vz * inv_len;
+
+            let (rgb_r, rgb_g, rgb_b) = crate::render::kernels::project::eval_sh_native_f16(
+                sh_coeffs_f16,
+                g * sh_f16_stride,
+                dir_x,
+                dir_y,
+                dir_z,
+                sh_degree,
+            );
+            shared_rgb_r[local_id as usize] = rgb_r;
+            shared_rgb_g[local_id as usize] = rgb_g;
+            shared_rgb_b[local_id as usize] = rgb_b;
+        } else {
+            shared_opacity[local_id as usize] = 0.0f32;
+        }
+
+        sync_cube();
+
+        let slot = (b & 1u32) as usize;
+        let next_slot = ((b + 1u32) & 1u32) as usize;
+        if local_id_u32 == 0u32 {
+            tile_alive[next_slot].store(0u32);
+        }
+
+        let batch_count = u32::min(256u32, total_in_tile - b * 256u32);
+        if inside_screen && !saturated {
+            for k in 0u32..batch_count {
+                let op_base = shared_opacity[k as usize];
+                if op_base > 0.003921569f32 {
+                    let mu_x = shared_xy_x[k as usize];
+                    let mu_y = shared_xy_y[k as usize];
+                    let dx = pix_center_x - mu_x;
+                    let dy = pix_center_y - mu_y;
+                    let a = shared_conic_a[k as usize];
+                    let b_coef = shared_conic_b[k as usize];
+                    let c = shared_conic_c[k as usize];
+
+                    let mut q = -0.5f32 * (a * dx * dx + 2.0f32 * b_coef * dx * dy + c * dy * dy);
+                    if q > 0.0f32 {
+                        q = 0.0f32;
+                    }
+                    if q >= -4.0f32 {
+                        let alpha = f32::min(0.99f32, op_base * f32::exp(q));
+                        if alpha >= 0.003921569f32 {
+                            let w = alpha * t;
+                            c_r += w * shared_rgb_r[k as usize];
+                            c_g += w * shared_rgb_g[k as usize];
+                            c_b += w * shared_rgb_b[k as usize];
+                            t *= 1.0f32 - alpha;
+                            if t < 0.001f32 {
+                                saturated = true;
+                                t = 0.0f32;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if inside_screen && !saturated {
+            tile_alive[slot].store(1u32);
+        }
+        sync_cube();
+
+        if tile_alive[slot].load() == 0u32 {
             break;
         }
     }
