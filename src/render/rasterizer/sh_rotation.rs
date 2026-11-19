@@ -2,10 +2,12 @@
 //!
 //! A Gaussian's SH coefficients are authored in the splat's local frame. When a
 //! volumetric cage rotates a splat, its view-dependent radiance must rotate with
-//! it. Instead of the discarded "inverse-ray" hack (which evaluated world-space
-//! SH along a rotated direction and therefore produced incorrect results for
-//! anything but degree 1 without re-authoring coefficients), we rotate the
-//! coefficients themselves.
+//! it. Because real spherical harmonics are closed under SO(3) rotations
+//! ($c'^\top Y_l(d) \equiv c^\top Y_l(R^\top d)$ for all degrees $l$), live GPU
+//! frames evaluate the rest-pose SH directly along the inverse-rotated view
+//! direction $R^\top d$, avoiding per-frame coefficient rotation and PCIe
+//! uploads. `ShRotator` rotates coefficients in-place for the CPU reference
+//! path and for exporting deformed `.ply` scenes.
 //!
 //! # Method
 //!

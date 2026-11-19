@@ -90,29 +90,29 @@ impl TileConfigUniforms {
     }
 }
 
-/// Calculates clamped tile bounding box $[tx_{\min}, tx_{\max}] \times [ty_{\min}, ty_{\max}]$ for a Gaussian.
-///
-/// Returns `None` if the Gaussian is culled (radius <= 0) or entirely off-screen.
+/// Calculates clamped tile bounding box $[tx_{\min}, tx_{\max}] \times [ty_{\min}, ty_{\max}]$
+/// from tight axis-aligned pixel half-extents `[extent_x, extent_y]`.
 #[inline]
-pub fn compute_gaussian_tile_bounds(
+#[allow(clippy::too_many_arguments)]
+pub fn compute_gaussian_tile_bounds_xy(
     center_x: f32,
     center_y: f32,
-    radius: f32,
+    extent_x: f32,
+    extent_y: f32,
     tiles_x: u32,
     tiles_y: u32,
     screen_width: u32,
     screen_height: u32,
 ) -> Option<(u32, u32, u32, u32)> {
-    if radius <= 0.0 || tiles_x == 0 || tiles_y == 0 {
+    if extent_x <= 0.0 || extent_y <= 0.0 || tiles_x == 0 || tiles_y == 0 {
         return None;
     }
 
-    let min_x = center_x - radius;
-    let max_x = center_x + radius;
-    let min_y = center_y - radius;
-    let max_y = center_y + radius;
+    let min_x = center_x - extent_x;
+    let max_x = center_x + extent_x;
+    let min_y = center_y - extent_y;
+    let max_y = center_y + extent_y;
 
-    // Viewport culling
     if max_x < 0.0 || min_x >= screen_width as f32 || max_y < 0.0 || min_y >= screen_height as f32 {
         return None;
     }
@@ -127,6 +127,85 @@ pub fn compute_gaussian_tile_bounds(
     }
 
     Some((tx_min, tx_max, ty_min, ty_max))
+}
+
+/// Exact convex quadratic ellipse-vs-tile intersection test.
+///
+/// Minimizes $Q(\Delta x, \Delta y) = a \Delta x^2 + 2 b \Delta x \Delta y + c \Delta y^2$
+/// over the rectangle of pixel centers inside tile `(tx, ty)` and checks whether
+/// $\alpha_{2\text{D}} \exp(-\tfrac{1}{2} Q_{\min}) \ge 1/255$ and $-\tfrac{1}{2} Q_{\min} \ge -4.0$.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn ellipse_intersects_tile(
+    mu_x: f32,
+    mu_y: f32,
+    conic: [f32; 3],
+    alpha_2d: f32,
+    tx: u32,
+    ty: u32,
+    screen_width: u32,
+    screen_height: u32,
+) -> bool {
+    if alpha_2d < (1.0 / 255.0) || screen_width == 0 || screen_height == 0 {
+        return false;
+    }
+
+    let x_start = tx * TILE_SIZE;
+    let y_start = ty * TILE_SIZE;
+    if x_start >= screen_width || y_start >= screen_height {
+        return false;
+    }
+
+    let tile_min_x = x_start as f32 + 0.5;
+    let tile_max_x = (x_start + TILE_SIZE - 1).min(screen_width - 1) as f32 + 0.5;
+    let tile_min_y = y_start as f32 + 0.5;
+    let tile_max_y = (y_start + TILE_SIZE - 1).min(screen_height - 1) as f32 + 0.5;
+
+    let dx0 = tile_min_x - mu_x;
+    let dx1 = tile_max_x - mu_x;
+    let dy0 = tile_min_y - mu_y;
+    let dy1 = tile_max_y - mu_y;
+
+    let a = conic[0];
+    let b = conic[1];
+    let c = conic[2];
+
+    let x_near = 0.0f32.clamp(dx0, dx1);
+    let y1 = (-b * x_near / c.max(1e-12)).clamp(dy0, dy1);
+    let q1 = a * x_near * x_near + 2.0 * b * x_near * y1 + c * y1 * y1;
+
+    let y_near = 0.0f32.clamp(dy0, dy1);
+    let x2 = (-b * y_near / a.max(1e-12)).clamp(dx0, dx1);
+    let q2 = a * x2 * x2 + 2.0 * b * x2 * y_near + c * y_near * y_near;
+
+    let min_quad = q1.min(q2);
+    let q_cutoff = (2.0 * (255.0 * alpha_2d).ln()).clamp(0.0, 8.0);
+    min_quad <= q_cutoff + 1e-4
+}
+
+/// Calculates clamped tile bounding box $[tx_{\min}, tx_{\max}] \times [ty_{\min}, ty_{\max}]$ for a Gaussian.
+///
+/// Returns `None` if the Gaussian is culled (radius <= 0) or entirely off-screen.
+#[inline]
+pub fn compute_gaussian_tile_bounds(
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    tiles_x: u32,
+    tiles_y: u32,
+    screen_width: u32,
+    screen_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    compute_gaussian_tile_bounds_xy(
+        center_x,
+        center_y,
+        radius,
+        radius,
+        tiles_x,
+        tiles_y,
+        screen_width,
+        screen_height,
+    )
 }
 
 /// Computes the number of tiles touched by a Gaussian.
@@ -217,5 +296,107 @@ mod tests {
         assert_eq!(count_tiles_touched(-50.0, 100.0, 10.0, 50, 38, 800, 600), 0);
         // Way to the right
         assert_eq!(count_tiles_touched(900.0, 100.0, 10.0, 50, 38, 800, 600), 0);
+    }
+
+    #[test]
+    fn test_tight_ellipse_aabb_and_exact_tile_intersection_have_zero_false_negatives() {
+        use crate::math::compute_conic_and_extents;
+
+        let width = 160u32;
+        let height = 128u32;
+        let tiles_x = width.div_ceil(TILE_SIZE);
+        let tiles_y = height.div_ceil(TILE_SIZE);
+
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next_f32 = || -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32) / ((1u32 << 24) as f32)
+        };
+
+        let mut square_total = 0u32;
+        let mut ellipse_total = 0u32;
+
+        for _ in 0..1000 {
+            let mu_x = -20.0 + next_f32() * (width as f32 + 40.0);
+            let mu_y = -20.0 + next_f32() * (height as f32 + 40.0);
+            let angle = next_f32() * std::f32::consts::PI;
+            let l1 = 0.5 + next_f32() * 900.0;
+            let l2 = 0.5 + next_f32() * 25.0;
+            let (s, c) = angle.sin_cos();
+            let sig_xx = c * c * l1 + s * s * l2;
+            let sig_xy = s * c * (l1 - l2);
+            let sig_yy = s * s * l1 + c * c * l2;
+            let alpha_2d = 0.01 + next_f32() * 0.98;
+
+            let Some((conic, ext)) = compute_conic_and_extents(sig_xx, sig_xy, sig_yy, alpha_2d)
+            else {
+                continue;
+            };
+
+            let r_iso = (3.0 * (l1.max(l2) + 0.3).sqrt()).ceil().clamp(1.0, 1024.0);
+            square_total += count_tiles_touched(mu_x, mu_y, r_iso, tiles_x, tiles_y, width, height);
+
+            let bounds = compute_gaussian_tile_bounds_xy(
+                mu_x,
+                mu_y,
+                ext[0] as f32,
+                ext[1] as f32,
+                tiles_x,
+                tiles_y,
+                width,
+                height,
+            );
+
+            for ty in 0..tiles_y {
+                for tx in 0..tiles_x {
+                    // Brute-force check whether ANY pixel center in this tile contributes.
+                    let mut pixel_hits = false;
+                    let x0 = tx * TILE_SIZE;
+                    let y0 = ty * TILE_SIZE;
+                    let x1 = ((tx + 1) * TILE_SIZE).min(width);
+                    let y1 = ((ty + 1) * TILE_SIZE).min(height);
+                    for py in y0..y1 {
+                        for px in x0..x1 {
+                            let dx = (px as f32 + 0.5) - mu_x;
+                            let dy = (py as f32 + 0.5) - mu_y;
+                            let q = -0.5
+                                * (conic[0] * dx * dx
+                                    + 2.0 * conic[1] * dx * dy
+                                    + conic[2] * dy * dy);
+                            if q >= -4.0 && (alpha_2d * q.exp()).min(0.99) >= (1.0 / 255.0) {
+                                pixel_hits = true;
+                                break;
+                            }
+                        }
+                        if pixel_hits {
+                            break;
+                        }
+                    }
+
+                    let in_aabb = bounds.is_some_and(|(bx0, bx1, by0, by1)| {
+                        tx >= bx0 && tx <= bx1 && ty >= by0 && ty <= by1
+                    });
+                    let exact = in_aabb
+                        && ellipse_intersects_tile(
+                            mu_x, mu_y, conic, alpha_2d, tx, ty, width, height,
+                        );
+
+                    if exact {
+                        ellipse_total += 1;
+                    }
+                    assert!(
+                        !pixel_hits || exact,
+                        "false negative for ellipse mu=({mu_x},{mu_y}) conic={conic:?} alpha={alpha_2d} tile=({tx},{ty}) bounds={bounds:?}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            ellipse_total * 2 < square_total,
+            "tight ellipse binning should emit <50% of isotropic square tiles ({ellipse_total} vs {square_total})"
+        );
     }
 }

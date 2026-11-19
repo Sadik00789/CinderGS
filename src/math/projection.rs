@@ -169,6 +169,73 @@ pub fn compute_conic_and_radius(
     Some((conic, r_clamped))
 }
 
+/// Opacity-aware Mahalanobis radius cutoff $\sigma_{\text{cutoff}}$ matching the
+/// compositor's `q >= -4.0` ($Q \le 8.0$) and `alpha >= 1/255` visibility thresholds.
+#[inline]
+pub fn opacity_sigma_cutoff(alpha_2d: f32) -> f32 {
+    if alpha_2d <= 1.0 / 255.0 {
+        return 0.0;
+    }
+    let q_max = (2.0 * (255.0 * alpha_2d).ln()).clamp(0.0, 8.0);
+    q_max.sqrt()
+}
+
+/// Computes conic coefficients `[a, b, c]` and tight axis-aligned pixel half-extents
+/// `[extent_x, extent_y]` directly from the regularized 2D covariance diagonal and
+/// compensated opacity `alpha_2d`.
+#[inline]
+pub fn compute_conic_and_extents(
+    sigma_2d_xx: f32,
+    sigma_2d_xy: f32,
+    sigma_2d_yy: f32,
+    alpha_2d: f32,
+) -> Option<([f32; 3], [i32; 2])> {
+    let s_xx = sigma_2d_xx + LOW_PASS_FILTER_VARIANCE;
+    let s_xy = sigma_2d_xy;
+    let s_yy = sigma_2d_yy + LOW_PASS_FILTER_VARIANCE;
+
+    let det = s_xx * s_yy - s_xy * s_xy;
+    if det <= MIN_DET_THRESHOLD {
+        return None;
+    }
+
+    let sigma = opacity_sigma_cutoff(alpha_2d);
+    if sigma <= 0.0 {
+        return None;
+    }
+
+    let inv_det = 1.0 / det;
+    let conic = [s_yy * inv_det, -s_xy * inv_det, s_xx * inv_det];
+
+    let ext_x = (sigma * s_xx.max(0.0).sqrt())
+        .ceil()
+        .clamp(MIN_SPLAT_RADIUS, MAX_SPLAT_RADIUS) as i32;
+    let ext_y = (sigma * s_yy.max(0.0).sqrt())
+        .ceil()
+        .clamp(MIN_SPLAT_RADIUS, MAX_SPLAT_RADIUS) as i32;
+
+    Some((conic, [ext_x, ext_y]))
+}
+
+/// Determines whether the tight axis-aligned box `[mu_x ± ext_x, mu_y ± ext_y]` lies
+/// strictly outside the viewport.
+#[inline]
+pub fn is_frustum_culled_xy(
+    mu_x: f32,
+    mu_y: f32,
+    extent_x: f32,
+    extent_y: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> bool {
+    let min_x = mu_x - extent_x;
+    let max_x = mu_x + extent_x;
+    let min_y = mu_y - extent_y;
+    let max_y = mu_y + extent_y;
+
+    max_x < 0.0 || min_x >= viewport_width || max_y < 0.0 || min_y >= viewport_height
+}
+
 /// Evaluates screen-space pixel coordinates:
 ///
 /// $$\mu_x = \frac{f_x t_x}{t_z} + c_x, \quad \mu_y = \frac{f_y t_y}{t_z} + c_y$$
