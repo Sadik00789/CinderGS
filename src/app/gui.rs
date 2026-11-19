@@ -14,6 +14,7 @@ pub struct GuiState {
     pub selected: Option<(usize, usize)>,
     pub sh_degree: u32,
     pub show_cage: bool,
+    pub vsync: bool,
     pub backend: ExecutionBackend,
     pub active_cage: usize,
     pub trigger_jiggle: bool,
@@ -48,6 +49,7 @@ impl Default for GuiState {
             selected: None,
             sh_degree: 3,
             show_cage: true,
+            vsync: true,
             backend: ExecutionBackend::CpuReference,
             active_cage: 0,
             trigger_jiggle: false,
@@ -156,6 +158,7 @@ pub fn render_gui(
                 );
             });
             ui.checkbox(&mut state.show_cage, "Show Cage Wireframe");
+            ui.checkbox(&mut state.vsync, "VSync (Uncap FPS when off)");
 
             ui.separator();
             ui.heading("Volumetric Cages");

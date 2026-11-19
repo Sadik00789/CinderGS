@@ -35,6 +35,18 @@ pub const CAGE_PALETTE: [[f32; 4]; 5] = [
     [0.95, 0.85, 0.25, 0.45],
 ];
 
+fn select_present_mode(vsync: bool, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if vsync {
+        wgpu::PresentMode::AutoVsync
+    } else if supported.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else if supported.contains(&wgpu::PresentMode::Immediate) {
+        wgpu::PresentMode::Immediate
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    }
+}
+
 /// Main application orchestrator managing the window lifecycle, WGPU device/surface,
 /// orbit camera, multi-cage deformation picking, timeline playback, and egui telemetry.
 pub struct CinderApp {
@@ -42,6 +54,8 @@ pub struct CinderApp {
     pub window: Option<Arc<Window>>,
     pub surface: Option<wgpu::Surface<'static>>,
     pub surface_config: Option<wgpu::SurfaceConfiguration>,
+    pub supported_present_modes: Vec<wgpu::PresentMode>,
+    pub current_vsync: bool,
     pub device: Option<wgpu::Device>,
     pub queue: Option<wgpu::Queue>,
     pub init_error: Option<String>,
@@ -88,6 +102,8 @@ impl CinderApp {
             window: None,
             surface: None,
             surface_config: None,
+            supported_present_modes: Vec::new(),
+            current_vsync: true,
             device: None,
             queue: None,
             init_error: None,
@@ -460,10 +476,11 @@ impl ApplicationHandler for CinderApp {
 
         let adapter_info = adapter.get_info();
         let adapter_limits = adapter.limits();
+        let required_features = crate::render::gpu::preferred_wgpu_features(&adapter);
         let (device, queue) =
             match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("CinderGSDevice"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter_limits,
                 ..Default::default()
             })) {
@@ -481,6 +498,7 @@ impl ApplicationHandler for CinderApp {
         let height = size.height.max(1);
 
         let surface_caps = surface.get_capabilities(&adapter);
+        let supported_present_modes = surface_caps.present_modes.clone();
         let surface_format = surface_caps
             .formats
             .iter()
@@ -493,13 +511,15 @@ impl ApplicationHandler for CinderApp {
             format: surface_format,
             width,
             height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: select_present_mode(self.gui_state.vsync, &supported_present_modes),
             desired_maximum_frame_latency: 2,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
+        self.supported_present_modes = supported_present_modes;
+        self.current_vsync = self.gui_state.vsync;
 
         let mut orchestrator = RenderPipelineOrchestrator::new(&device, surface_format);
         orchestrator.resize(&device, width, height);
@@ -881,6 +901,16 @@ impl ApplicationHandler for CinderApp {
                 let Some(queue) = self.queue.as_ref() else {
                     return;
                 };
+                if self.gui_state.vsync != self.current_vsync {
+                    if let Some(config) = self.surface_config.as_mut() {
+                        config.present_mode = select_present_mode(
+                            self.gui_state.vsync,
+                            &self.supported_present_modes,
+                        );
+                        surface.configure(device, config);
+                        self.current_vsync = self.gui_state.vsync;
+                    }
+                }
                 let Some(config) = self.surface_config.as_ref() else {
                     return;
                 };

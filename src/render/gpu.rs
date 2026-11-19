@@ -23,6 +23,22 @@ pub enum GpuError {
     /// The runtime is not compiled for this target (e.g. `wasm32`).
     #[error("GPU compute is unavailable on this target")]
     UnsupportedTarget,
+
+    /// A GPU buffer operation, kernel readback, or profiling query failed.
+    #[error("GPU execution failed: {0}")]
+    Execution(String),
+}
+
+/// Preferred optional hardware features requested when creating WGPU devices.
+///
+/// Intersecting these with `adapter.features()` enables native FP16 arithmetic,
+/// hardware subgroup operations (for fast ballot/prefix scan), and GPU hardware
+/// timestamp queries for kernel profiling without breaking adapters that lack them.
+#[inline]
+pub fn preferred_wgpu_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    let desired =
+        wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP | wgpu::Features::TIMESTAMP_QUERY;
+    adapter.features() & desired
 }
 
 /// A persistent CubeCL client plus human-readable device information.
@@ -30,6 +46,8 @@ pub struct GpuCompute {
     client: Client,
     adapter_name: String,
     backend_name: String,
+    is_shared: bool,
+    enabled_features: wgpu::Features,
 }
 
 impl std::fmt::Debug for GpuCompute {
@@ -37,6 +55,7 @@ impl std::fmt::Debug for GpuCompute {
         f.debug_struct("GpuCompute")
             .field("adapter", &self.adapter_name)
             .field("backend", &self.backend_name)
+            .field("shared", &self.is_shared)
             .finish_non_exhaustive()
     }
 }
@@ -63,11 +82,14 @@ impl GpuCompute {
             match cubecl::wgpu::try_init_setup::<AutoGraphicsApi>(&device, options) {
                 Ok(setup) => {
                     let info = setup.adapter.get_info();
+                    let enabled_features = setup.device.features();
                     let client = cubecl::Device::Wgpu(device).client();
                     return Ok(Self {
                         client,
                         adapter_name: info.name,
                         backend_name: format!("{:?}", info.backend),
+                        is_shared: false,
+                        enabled_features,
                     });
                 }
                 Err(err) => last_error = err.to_string(),
@@ -96,6 +118,7 @@ impl GpuCompute {
         backend: wgpu::Backend,
     ) -> Result<Self, GpuError> {
         let info = adapter.get_info();
+        let enabled_features = device.features();
         let setup = cubecl::wgpu::WgpuSetup {
             instance,
             adapter,
@@ -111,6 +134,8 @@ impl GpuCompute {
             client,
             adapter_name: info.name,
             backend_name: format!("{:?}", info.backend),
+            is_shared: true,
+            enabled_features,
         })
     }
 
@@ -118,6 +143,50 @@ impl GpuCompute {
     #[inline]
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// True when CubeCL shares the presentation `wgpu::Device` and `wgpu::Queue`,
+    /// enabling zero-copy `copy_buffer_to_texture` directly from compute handles.
+    #[inline]
+    pub fn is_shared_device(&self) -> bool {
+        self.is_shared
+    }
+
+    /// WGPU hardware features enabled on the underlying device.
+    #[inline]
+    pub fn enabled_features(&self) -> wgpu::Features {
+        self.enabled_features
+    }
+
+    /// True when native `f16` storage/arithmetic (`SHADER_F16`) is supported by both
+    /// the WGPU device and CubeCL runtime.
+    #[inline]
+    pub fn supports_f16(&self) -> bool {
+        self.enabled_features.contains(wgpu::Features::SHADER_F16)
+            && self
+                .client
+                .properties()
+                .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16))
+    }
+
+    /// True when hardware subgroup operations (`SUBGROUP`) are supported by both
+    /// the WGPU device and CubeCL runtime.
+    #[inline]
+    pub fn supports_subgroups(&self) -> bool {
+        self.enabled_features.contains(wgpu::Features::SUBGROUP)
+            && self
+                .client
+                .properties()
+                .features
+                .plane
+                .contains(cubecl::features::Plane::Ops)
+    }
+
+    /// True when WGPU hardware timestamp queries (`TIMESTAMP_QUERY`) are enabled.
+    #[inline]
+    pub fn supports_timestamps(&self) -> bool {
+        self.enabled_features
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
     }
 
     /// Adapter name reported by WGPU.

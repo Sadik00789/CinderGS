@@ -25,6 +25,8 @@ pub struct PolyCageMesh {
 pub struct MvcBindings {
     /// Flattened dense weight table `[num_gaussians * num_cage_vertices]`.
     pub weights: Vec<f32>,
+    /// Precomputed finite-difference weight gradients `[num_gaussians * num_cage_vertices]` (`∂w_j/∂x`, `∂w_j/∂y`, `∂w_j/∂z`).
+    pub weight_gradients: Vec<[f32; 3]>,
     /// Number of cage vertices per Gaussian row.
     pub num_cage_vertices: usize,
     /// Whether each Gaussian lies inside the closed cage surface.
@@ -49,6 +51,30 @@ impl MvcBindings {
     pub fn weights_for(&self, idx: usize) -> &[f32] {
         let start = idx * self.num_cage_vertices;
         &self.weights[start..start + self.num_cage_vertices]
+    }
+
+    /// Slice of precomputed MVC weight gradients for Gaussian `idx`.
+    #[inline]
+    pub fn gradients_for(&self, idx: usize) -> &[[f32; 3]] {
+        let start = idx * self.num_cage_vertices;
+        &self.weight_gradients[start..start + self.num_cage_vertices]
+    }
+
+    /// Evaluates the local deformation gradient $F = \partial \phi / \partial X$ in $O(V)$ using
+    /// precomputed finite-difference weight gradients.
+    #[inline]
+    pub fn local_jacobian(&self, idx: usize, deformed_vertices: &[[f32; 3]]) -> Mat3 {
+        let grads = self.gradients_for(idx);
+        let mut col0 = Vec3::ZERO;
+        let mut col1 = Vec3::ZERO;
+        let mut col2 = Vec3::ZERO;
+        for (g, v) in grads.iter().zip(deformed_vertices.iter()) {
+            let pv = Vec3::from(*v);
+            col0 += pv * g[0];
+            col1 += pv * g[1];
+            col2 += pv * g[2];
+        }
+        Mat3::from_cols(col0, col1, col2)
     }
 }
 
@@ -454,36 +480,8 @@ impl PolyCageMesh {
         p
     }
 
-    /// Binds an array of Gaussian rest positions to this closed MVC cage in parallel.
-    pub fn bind_gaussians(&self, positions: &[[f32; 3]]) -> MvcBindings {
-        let nv = self.rest_vertices.len();
-        let n = positions.len();
-        let rows: Vec<(bool, Vec<f32>)> = parallel::map_slice(positions, |&p| {
-            let inside = self.contains_point(Vec3::from(p));
-            let row = if inside {
-                self.compute_mvc_weights(p)
-            } else {
-                vec![0.0; nv]
-            };
-            (inside, row)
-        });
-
-        let mut weights = Vec::with_capacity(n * nv);
-        let mut bound_mask = Vec::with_capacity(n);
-        for (inside, row) in rows {
-            bound_mask.push(inside);
-            weights.extend_from_slice(&row);
-        }
-
-        MvcBindings {
-            weights,
-            num_cage_vertices: nv,
-            bound_mask,
-        }
-    }
-
-    /// Approximates the smooth MVC deformation gradient $F = \partial \phi / \partial X$ at `point`.
-    pub fn local_jacobian(&self, point: [f32; 3], deformed_vertices: &[[f32; 3]]) -> Mat3 {
+    /// Central-difference step size derived from the cage bounding-box diagonal.
+    fn jacobian_step_size(&self) -> f32 {
         let mut bmin = Vec3::splat(f32::INFINITY);
         let mut bmax = Vec3::splat(f32::NEG_INFINITY);
         for &v in &self.rest_vertices {
@@ -492,7 +490,59 @@ impl PolyCageMesh {
             bmax = bmax.max(pv);
         }
         let diag = bmax.distance(bmin).max(1e-3);
-        let h = (diag * 1e-3).clamp(1e-5, 1e-2);
+        (diag * 1e-3).clamp(1e-5, 1e-2)
+    }
+
+    /// Binds an array of Gaussian rest positions to this closed MVC cage in parallel,
+    /// precomputing central-difference weight gradients $\nabla w_j(\mathbf{x}_i)$.
+    pub fn bind_gaussians(&self, positions: &[[f32; 3]]) -> MvcBindings {
+        let nv = self.rest_vertices.len();
+        let n = positions.len();
+        let h = self.jacobian_step_size();
+        let inv_2h = 0.5 / h;
+
+        let rows: Vec<(bool, Vec<f32>, Vec<[f32; 3]>)> = parallel::map_slice(positions, |&p| {
+            let inside = self.contains_point(Vec3::from(p));
+            if !inside {
+                return (false, vec![0.0; nv], vec![[0.0; 3]; nv]);
+            }
+
+            let row = self.compute_mvc_weights(p);
+            let mut grads = vec![[0.0f32; 3]; nv];
+            for axis in 0..3 {
+                let mut p_plus = p;
+                let mut p_minus = p;
+                p_plus[axis] += h;
+                p_minus[axis] -= h;
+                let w_plus = self.compute_mvc_weights(p_plus);
+                let w_minus = self.compute_mvc_weights(p_minus);
+                for j in 0..nv {
+                    grads[j][axis] = (w_plus[j] - w_minus[j]) * inv_2h;
+                }
+            }
+            (true, row, grads)
+        });
+
+        let mut weights = Vec::with_capacity(n * nv);
+        let mut weight_gradients = Vec::with_capacity(n * nv);
+        let mut bound_mask = Vec::with_capacity(n);
+        for (inside, row, grads) in rows {
+            bound_mask.push(inside);
+            weights.extend_from_slice(&row);
+            weight_gradients.extend_from_slice(&grads);
+        }
+
+        MvcBindings {
+            weights,
+            weight_gradients,
+            num_cage_vertices: nv,
+            bound_mask,
+        }
+    }
+
+    /// Approximates the smooth MVC deformation gradient $F = \partial \phi / \partial X$ at `point`.
+    pub fn local_jacobian(&self, point: [f32; 3], deformed_vertices: &[[f32; 3]]) -> Mat3 {
+        let h = self.jacobian_step_size();
         let inv_2h = 0.5 / h;
 
         let sample_col = |axis: usize| -> Vec3 {
@@ -520,77 +570,123 @@ impl PolyCageMesh {
         split_stretch_threshold: f32,
         mip_filter_3d_var: f32,
     ) -> DeformedSceneOutput {
+        const MVC_DEFORM_CHUNK: usize = 1024;
         let count = scene.count;
+        if count == 0 {
+            return DeformedSceneOutput {
+                scene: GaussianSceneSoa::new(),
+            };
+        }
+
         let degree = sh_degree.min(3);
         let nv = self.rest_vertices.len();
+        let has_precomputed_grads = bindings.weight_gradients.len() == count * nv;
 
         let mut positions = vec![0.0f32; count * 3];
         let mut covariances_3d = vec![0.0f32; count * 6];
         let mut opacities = vec![0.0f32; count];
         let mut sh_coeffs = vec![0.0f32; count * 48];
-        let mut needs_split = if split_stretch_threshold > 0.0 {
-            vec![0u8; count]
+
+        parallel::zip_fill_4(
+            &mut positions,
+            &mut covariances_3d,
+            &mut opacities,
+            &mut sh_coeffs,
+            [
+                MVC_DEFORM_CHUNK * 3,
+                MVC_DEFORM_CHUNK * 6,
+                MVC_DEFORM_CHUNK,
+                MVC_DEFORM_CHUNK * 48,
+            ],
+            |base, pos_chunk, cov_chunk, opa_chunk, sh_chunk| {
+                for local in 0..opa_chunk.len() {
+                    let i = base + local;
+                    let rest_pos = [
+                        scene.positions[i * 3],
+                        scene.positions[i * 3 + 1],
+                        scene.positions[i * 3 + 2],
+                    ];
+                    let rest_cov = [
+                        scene.covariances_3d[i * 6],
+                        scene.covariances_3d[i * 6 + 1],
+                        scene.covariances_3d[i * 6 + 2],
+                        scene.covariances_3d[i * 6 + 3],
+                        scene.covariances_3d[i * 6 + 4],
+                        scene.covariances_3d[i * 6 + 5],
+                    ];
+                    let rest_alpha = scene.opacities[i];
+                    let rest_sh = &scene.sh_coeffs[i * 48..(i + 1) * 48];
+
+                    if !bindings.bound_mask[i] {
+                        pos_chunk[local * 3..local * 3 + 3].copy_from_slice(&rest_pos);
+                        cov_chunk[local * 6..local * 6 + 6].copy_from_slice(&rest_cov);
+                        opa_chunk[local] = rest_alpha;
+                        sh_chunk[local * 48..(local + 1) * 48].copy_from_slice(rest_sh);
+                        continue;
+                    }
+
+                    let w = &bindings.weights[i * nv..(i + 1) * nv];
+                    let deformed_pos = Self::evaluate_position(w, deformed_vertices).to_array();
+                    let f = if has_precomputed_grads {
+                        bindings.local_jacobian(i, deformed_vertices)
+                    } else {
+                        self.local_jacobian(rest_pos, deformed_vertices)
+                    };
+                    let (rotation, _) = higham_polar_decomposition(f);
+                    let f_cov = f * covariance_matrix_from_slice(&rest_cov) * f.transpose();
+                    let raw_cov = [
+                        f_cov.x_axis.x,
+                        f_cov.x_axis.y,
+                        f_cov.x_axis.z,
+                        f_cov.y_axis.y,
+                        f_cov.y_axis.z,
+                        f_cov.z_axis.z,
+                    ];
+
+                    pos_chunk[local * 3..local * 3 + 3].copy_from_slice(&deformed_pos);
+                    cov_chunk[local * 6..local * 6 + 6].copy_from_slice(&raw_cov);
+                    opa_chunk[local] = rest_alpha;
+                    sh_chunk[local * 48..(local + 1) * 48].copy_from_slice(rest_sh);
+                    if degree > 0 {
+                        let rotator = ShRotator::new(rotation, degree);
+                        if let Ok(dst) =
+                            <&mut [f32; 48]>::try_from(&mut sh_chunk[local * 48..(local + 1) * 48])
+                        {
+                            rotator.apply(dst);
+                        }
+                    }
+                }
+            },
+        );
+
+        let needs_split: Vec<u8> = if split_stretch_threshold > 0.0 {
+            if has_precomputed_grads {
+                parallel::map_range(count, |i| {
+                    if !bindings.bound_mask[i] {
+                        return 0;
+                    }
+                    let f = bindings.local_jacobian(i, deformed_vertices);
+                    let strain = jacobian_singular_values(f);
+                    u8::from(strain.max_stretch() > split_stretch_threshold)
+                })
+            } else {
+                parallel::map_range(count, |i| {
+                    if !bindings.bound_mask[i] {
+                        return 0;
+                    }
+                    let rest_pos = [
+                        scene.positions[i * 3],
+                        scene.positions[i * 3 + 1],
+                        scene.positions[i * 3 + 2],
+                    ];
+                    let f = self.local_jacobian(rest_pos, deformed_vertices);
+                    let strain = jacobian_singular_values(f);
+                    u8::from(strain.max_stretch() > split_stretch_threshold)
+                })
+            }
         } else {
             Vec::new()
         };
-
-        for i in 0..count {
-            let rest_pos = [
-                scene.positions[i * 3],
-                scene.positions[i * 3 + 1],
-                scene.positions[i * 3 + 2],
-            ];
-            let rest_cov = [
-                scene.covariances_3d[i * 6],
-                scene.covariances_3d[i * 6 + 1],
-                scene.covariances_3d[i * 6 + 2],
-                scene.covariances_3d[i * 6 + 3],
-                scene.covariances_3d[i * 6 + 4],
-                scene.covariances_3d[i * 6 + 5],
-            ];
-            let rest_alpha = scene.opacities[i];
-            let rest_sh = &scene.sh_coeffs[i * 48..(i + 1) * 48];
-
-            if !bindings.bound_mask[i] {
-                positions[i * 3..i * 3 + 3].copy_from_slice(&rest_pos);
-                covariances_3d[i * 6..i * 6 + 6].copy_from_slice(&rest_cov);
-                opacities[i] = rest_alpha;
-                sh_coeffs[i * 48..(i + 1) * 48].copy_from_slice(rest_sh);
-                continue;
-            }
-
-            let w = &bindings.weights[i * nv..(i + 1) * nv];
-            let deformed_pos = Self::evaluate_position(w, deformed_vertices).to_array();
-            let f = self.local_jacobian(rest_pos, deformed_vertices);
-            let (rotation, _) = higham_polar_decomposition(f);
-            let f_cov = f * covariance_matrix_from_slice(&rest_cov) * f.transpose();
-            let raw_cov = [
-                f_cov.x_axis.x,
-                f_cov.x_axis.y,
-                f_cov.x_axis.z,
-                f_cov.y_axis.y,
-                f_cov.y_axis.z,
-                f_cov.z_axis.z,
-            ];
-
-            positions[i * 3..i * 3 + 3].copy_from_slice(&deformed_pos);
-            covariances_3d[i * 6..i * 6 + 6].copy_from_slice(&raw_cov);
-            opacities[i] = rest_alpha;
-            sh_coeffs[i * 48..(i + 1) * 48].copy_from_slice(rest_sh);
-            if degree > 0 {
-                let rotator = ShRotator::new(rotation, degree);
-                if let Ok(dst) = <&mut [f32; 48]>::try_from(&mut sh_coeffs[i * 48..(i + 1) * 48]) {
-                    rotator.apply(dst);
-                }
-            }
-
-            if split_stretch_threshold > 0.0 {
-                let strain = jacobian_singular_values(f);
-                if strain.max_stretch() > split_stretch_threshold {
-                    needs_split[i] = 1;
-                }
-            }
-        }
 
         let mut total_count = count;
         for i in 0..count {
@@ -787,5 +883,26 @@ f 3 1 4
         assert_eq!(out.scene.len(), 3);
         // Outside splat keeps rest position.
         assert!((out.scene.positions[3] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mvc_precomputed_gradients_match_local_jacobian() {
+        let oct = PolyCageMesh::create_octahedron_cage([0.1, -0.2, 0.3], 2.5);
+        let pts = [[0.2, -0.1, 0.4], [-0.4, 0.3, -0.1], [0.0, 0.0, 0.0]];
+        let bindings = oct.bind_gaussians(&pts);
+        let mut deformed = oct.rest_vertices.clone();
+        deformed[0][0] += 0.45;
+        deformed[2][1] -= 0.3;
+        deformed[4][2] += 0.2;
+
+        for (i, &pt) in pts.iter().enumerate() {
+            assert!(bindings.bound_mask[i]);
+            let expected = oct.local_jacobian(pt, &deformed);
+            let actual = bindings.local_jacobian(i, &deformed);
+            assert!(
+                actual.abs_diff_eq(expected, 1e-5),
+                "precomputed MVC gradient Jacobian mismatch at {i}: {actual:?} vs {expected:?}"
+            );
+        }
     }
 }
