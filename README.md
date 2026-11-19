@@ -10,7 +10,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85+-blue.svg?style=flat-square&logo=rust)](Cargo.toml)
 [![WGPU 30](https://img.shields.io/badge/WGPU-v30.0-blue.svg?style=flat-square&logo=webgpu)](https://wgpu.rs/)
 [![CubeCL 0.11](https://img.shields.io/badge/CubeCL-v0.11-darkgreen.svg?style=flat-square)](https://cubecl.org/)
-[![Tests](https://img.shields.io/badge/Tests-167%20passing-brightgreen.svg?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-177%20passing-brightgreen.svg?style=flat-square)](tests/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20WASM-lightgrey.svg?style=flat-square)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=flat-square)](LICENSE)
 
@@ -47,57 +47,57 @@ Whether ingesting multi-million Gaussian captures from raw PLY files, deforming 
 
 | Domain | Capability Highlights |
 | :--- | :--- |
-| **GPU Compute & Rasterization** | • Native compute kernels via **CubeCL 0.11** targeting Vulkan, Metal, and DirectX 12.<br>• Exact **CPU reference backend** with multi-threaded Rayon execution.<br>• **Unified device model**: single `wgpu::Device` and `Queue` shared across compute kernels and swapchain surface.<br>• GPU-driven frustum, opacity, and screen-radius culling writing `IndirectDispatchArgs` so culled splats skip tile binning.<br>• Compact `QuantizedGaussianSceneSoa` (`f16` covariance & SH packing + 32-bit octahedral rotations) cutting scene footprint up to ~1.8×–4.1× across SH degrees 3–1.<br>• 256-thread shared-memory 16×16 tile compositor with **tile-wide early transmittance termination** ($`T < \epsilon`$) and 3D Mip-Splatting / 2D EWA anti-aliasing filter.<br>• Full world-space Spherical Harmonics (SH) evaluation across degrees 0 to 3. |
-| **Volumetric Cage Kinematics** | • Volumetric tetrahedral cages AND **arbitrary closed low-poly cage meshes via 3D Mean Value Coordinates (MVC)** (`PolyCageMesh`, Wavefront `.obj` parser, winding-number containment).<br>• **Strain-driven transient adaptive splitting**: computes local Jacobian singular values and splits over-stretched splats along their major axis without mutating canonical rest-state `.ply` data.<br>• Closed-form covariance transport `Σ' = J Σ Jᵀ` with 3D Mip-Splatting and diagonal regularization.<br>• Optical density stabilization: `α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))`.<br>• Exact monomial SH rotation matrices for bands 1–3 via polar decomposition `J = R S`.<br>• Multi-cage support with individual stiffness, damping, rest configurations, and wireframes. |
+| **GPU Compute & Rasterization** | • **100% GPU-resident persistent pipeline** (`GpuSceneState` + `GpuFrameArena`) via **CubeCL 0.11** targeting Vulkan, Metal, and DirectX 12 — eliminating per-frame re-uploads and PCIe framebuffer readbacks.<br>• **Unified shared device & hardware feature negotiation**: requests `SHADER_F16`, `SUBGROUP`, and `TIMESTAMP_QUERY` when supported on a single shared `wgpu::Device` and `Queue`.<br>• **Zero-copy compute-to-texture blit**: packs `RGBA8` rows aligned to `256` bytes and copies directly GPU-to-GPU via `copy_buffer_to_texture` into `Rgba8UnormSrgb` swapchain surfaces.<br>• **Pre-evaluated inverse-ray SH**: Stage 2 transforms view directions by $`\mathbf{R}^\top \mathbf{d}`$ and evaluates degrees 0–3 once per surviving splat, cutting Stage 4 compositor bandwidth by ~16×.<br>• Cooperative 256-thread shared-memory 16×16 tile compositor with double-buffered `plane_any` subgroup early transmittance termination ($`T < \epsilon`$) and 3D/2D Mip-Splatting EWA filtering.<br>• Exact multi-threaded Rayon **CPU reference backend** and `QuantizedGaussianSceneSoa` (`f16` / octahedral) support. |
+| **Volumetric Cage Kinematics** | • Volumetric tetrahedral cages AND **arbitrary closed low-poly cage meshes via 3D Mean Value Coordinates (MVC)** (`PolyCageMesh`, Wavefront `.obj` parser, precomputed `weight_gradients`, parallel `deform_scene_cpu`).<br>• **GPU polar decomposition & atomic split compaction**: computes per-tet Jacobians, 5-step Higham Newton-Schulz polar rotation $`\mathbf{R} \in \mathrm{SO}(3)`$, and atomically compacts strain-split children along their major axis without mutating canonical `.ply` data.<br>• Closed-form covariance transport `Σ' = J Σ Jᵀ` with 3D Mip-Splatting and diagonal regularization.<br>• Optical density stabilization: `α' = 1 − (1 − α)^(1 / clamp(det J, 0.6, 1.8))`.<br>• Multi-cage support with per-cage stiffness, damping, rest configurations, and dirty-flag GPU skip when stationary. |
 | **Physics & Dynamics** | • Semi-implicit Euler spring solver with frame-rate independent exponential damping (`γ = exp(−c Δt)`).<br>• **Persistent multi-handle vertex pinning** (`pinned_handles`) and **half-space collision planes** (`CollisionPlane`) in `dynamics.rs` and `picker.rs`.<br>• Real-time screen-space cage vertex picking and camera-plane dragging.<br>• Automated jiggle excitation and settling simulations. |
-| **Sorting & Caching** | • Deterministic 64-bit `(tile_id, depth_key)` parallel active-splat sorting.<br>• **Sort Cache Optimization**: Reuses tile ordering across frames when camera and cages are static, avoiding redundant passes during inspection. |
+| **Sorting & Caching** | • **Full GPU Stage 3**: opacity-aware tight ellipse AABBs + exact quadratic ellipse-vs-tile intersection, 3-level Blelloch exclusive prefix scan (`scan.rs`), and 4-bit LSD radix sort (`radix_sort.rs`) with dynamic relative-float depth precision (and 64-bit fallback for `> 65,535` tiles).<br>• **Temporal Persistence**: dirty-flag Stage 1 skip during camera orbits plus GPU Stage 3 sort/range cache reuse during static views. |
 | **PLY Ingestion & Export** | • Robust schema-driven header parser and **binary `.ply` serializer** (`PlyLoader::save_file` for deformed snapshots).<br>• Handles `binary_little_endian` / `binary_big_endian`, `float` and `double` scalars, arbitrary property orderings, and custom attributes.<br>• Spherical harmonics degrees 0–3 (9/24/45 `f_rest` coefficients) repacked cleanly between canonical `.ply` and internal SoA layouts.<br>• High-throughput zero-copy `mmap` fast path for canonical 62-float buffers.<br>• Rich error diagnostics through dedicated `PlyError` variants. |
 | **Intelligent Auto-Framing** | • Statistical outlier rejection via 2nd/98th percentile bounding box trimming.<br>• Automatic derivation of hero cage dimensions, orbit pivot, and focal distance.<br>• Explicit CLI override flags (`--look-at`, `--distance`, `--bounds`) for room-scale captures. |
-| **Production Tooling** | • **Headless Render Farm** (`render`): Scriptable offline renderer reading JSON camera paths.<br>• **Autonomous Demo Recorder** (`record_demo`): Frame generator with automatic MP4/GIF encoding.<br>• **Interactive Timeline & Deterministic Export**: Keyframed camera trajectories and cage poses with live scrubbing, deformed `.ply` snapshots, and deterministic image sequence exports.<br>• **WebAssembly Drop-Zone**: In-browser PLY validation and inspection (including quantized memory footprint telemetry) with zero network transmission. |
+| **Production Tooling** | • **Headless Render Farm** (`render`): Scriptable offline renderer reading JSON camera paths.<br>• **Autonomous Demo Recorder** (`record_demo`): Streams raw `RGBA8` frames over a pipe into a single-pass dual-output `ffmpeg` encoder for fast simultaneous MP4 + GIF generation (plus optional `--save-frames`).<br>• **Interactive Timeline & Deterministic Export**: Keyframed camera trajectories and cage poses with live scrubbing, deformed `.ply` snapshots, and deterministic image sequence exports.<br>• **WebAssembly Drop-Zone**: In-browser PLY validation and inspection (including quantized memory footprint telemetry) with zero network transmission. |
 
 ---
 
 ## 🏗️ Architecture & Pipeline
 
-CinderGS processes scenes through a staged pipeline designed to maximize throughput while preserving deterministic ordering and state caching:
+CinderGS processes scenes through a **persistent GPU-resident pipeline** (`GpuSceneState` + `GpuFrameArena`) that uploads rest geometry and cage topology once on load/rebind and keeps Stages 1–5 resident in VRAM with zero per-frame host readbacks during interactive rendering:
 
 ```text
- PLY Capture ──► Schema Parser ──► GaussianSceneSoa
-                                          │
-                                          ▼
+ PLY Capture ──► Schema Parser ──► GaussianSceneSoa ──► Persistent VRAM (GpuSceneState)
+                                                               │
+                                                               ▼
                            ┌─────────────────────────────────────────┐
                            │   CageScene (Tet & MVC Poly Cages)      │
                            │   Spring Solver, Pins & Collision Planes│
                            └────────────────────┬────────────────────┘
-                                                │ Deformed Vertices
+                                                │ Cage Vertices (skipped when stationary)
                                                 ▼
    ┌────────────────────────────────────────────────────────────────────────┐
-   │ Stage 1: Cage Deformation & Transient Strain Splitting        [CPU/GPU]│
+   │ Stage 1: Deformation, Polar Rotation & Split Compaction      [GPU/CPU]│
+   │   • Per-tet Jacobian + 5-step Newton-Schulz polar rotation R ∈ SO(3)   │
    │   • Vertex mapping:       x' = Σ wₖ Xₖ  (Tet barycentric or 3D MVC)    │
-   │   • Covariance transport: Σ' = J Σ Jᵀ + Mip₃D I,  J = Dₛ Dₘ⁻¹          │
-   │   • Strain splitting:     σ_max(J) > τ ⇒ transient major-axis child    │
-   │   • Opacity & SH rot:     α' stabilization + polar rotation J = R S    │
+   │   • Covariance transport: Σ' = J Σ Jᵀ + Mip₃D I,  α' stabilization     │
+   │   • Atomic split compact: σ_max(J) > τ ⇒ transient major-axis child    │
    ├────────────────────────────────────────────────────────────────────────┤
-   │ Stage 2: EWA Projection, Culling & Quantization              [CPU/GPU]│
-   │   • Frustum, opacity, and min-radius culling ⇒ IndirectDispatchArgs    │
-   │   • 3D-to-2D covariance projection: Σ₂D = J_cam Σ' J_camᵀ + filter₂D I │
-   │   • Optional f16 + octahedral rotation scene packing                   │
+   │ Stage 2: EWA Projection, Inverse-Ray SH & Compaction         [GPU/CPU]│
+   │   • Camera projection, 3D/2D Mip-Splatting EWA, & workgroup scan cull  │
+   │   • Tight opacity-aware ellipse AABBs (extent_x, extent_y)             │
+   │   • Exact inverse-ray SH (Rᵀ d, degrees 0–3) ⇒ compact splat_attrs     │
    ├────────────────────────────────────────────────────────────────────────┤
-   │ Stage 3: Active Tile Binning & 64-bit Sort                        [CPU]│
-   │   • Overlap counting over surviving active splats only                 │
-   │   • Parallel sort on composite keys: (tile_id << 32) | depth           │
-   │   • Sort Cache: bypassed when camera, cages, and filter settings hold  │
+   │ Stage 3: GPU Prefix Scan, Radix Sort & Tile Ranges           [GPU/CPU]│
+   │   • Tight quadratic ellipse-vs-tile count & dynamic-precision key emit │
+   │   • 3-level Blelloch scan + 4-bit LSD radix sort (subgroups/Blelloch)  │
+   │   • Temporal Cache: skipped when camera & cages are unchanged          │
    ├────────────────────────────────────────────────────────────────────────┤
-   │ Stage 4: Tile Compositor                                      [CPU/GPU]│
-   │   • 256-thread shared-memory workgroups (16×16 pixels/tile)            │
-   │   • World-space Spherical Harmonics evaluation (degrees 0–3 / f16)     │
-   │   • Front-to-back blending with tile-wide early T < ε termination      │
+   │ Stage 4: Cooperative Tile Compositor -> Packed RGBA8         [GPU/CPU]│
+   │   • 256-thread shared-memory 16×16 tiles over 4 storage buffers (~16×  │
+   │     less bandwidth via pre-evaluated RGB)                              │
+   │   • Double-buffered plane_any early T < ε termination & RGBA8 packing  │
    ├────────────────────────────────────────────────────────────────────────┤
-   │ Stage 5: Offscreen Blit Pass                                     [WGPU]│
-   │   • sRGB transfer, gamma correction, and fullscreen presentation blit  │
+   │ Stage 5: Zero-Copy Buffer-to-Texture Blit                       [WGPU]│
+   │   • GPU-to-GPU copy_buffer_to_texture into Rgba8UnormSrgb swapchain    │
    ├────────────────────────────────────────────────────────────────────────┤
-   │ Stage 6: Overlays & Telemetry                                    [WGPU]│
-   │   • Wireframe cage rendering, vertex handles, and immediate-mode HUD   │
+   │ Stage 6: Overlays & Telemetry                                   [WGPU]│
+   │   • Wireframe cage rendering, vertex handles, and egui HUD (+ VSync)   │
    └────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -130,42 +130,52 @@ When a tetrahedron expands or compresses, the apparent volumetric density change
 ```
 
 #### 4. Spherical Harmonics Rotation
-Monomial rotation representations for degree 1 (3×3), degree 2 (5×5), and degree 3 (7×7) are evaluated using the polar rotation factor $`\mathbf{R}`$ from $`\mathbf{J} = \mathbf{R} \mathbf{S}`$, ensuring view-dependent color stays consistent under large rotational deformations.
+In real-time GPU rendering, each tetrahedron's $`\mathrm{SO}(3)`$ polar rotation $`\mathbf{R}`$ (from $`\mathbf{J} = \mathbf{R}\mathbf{S}`$) transforms view directions into rest-frame coordinates $`\mathbf{d}_{\mathrm{local}} = \mathbf{R}^\top \mathbf{d}`$ before evaluating static VRAM SH coefficients once per surviving splat in Stage 2 — mathematically exact across degrees 0–3 while avoiding per-frame coefficient rotation. For deformed `.ply` snapshot exports, `ShRotator` rotates coefficients explicitly via exact degree 1 (3×3), degree 2 (5×5), and degree 3 (7×7) Wigner/monomial matrices.
 
 #### 5. Strain-Driven Adaptive Splitting & Anti-Aliasing
-Under strong tensile deformation ($`\sigma_{\max}(\mathbf{J}) > \tau`$), a splat's deformed 3D covariance $`\mathbf{\Sigma}'`$ is factored via eigen-decomposition along its major axis $`\mathbf{u}_{\max}`$ and transiently split into two overlapping child Gaussians without modifying the rest-state `.ply`. Isotropic 3D Mip-Splatting and 2D EWA low-pass covariance filters ($`\mathbf{\Sigma}' + v_{\mathrm{mip}} \mathbf{I}`$, $`\mathbf{\Sigma}_{2\mathrm{D}} + v_{2\mathrm{D}} \mathbf{I}`$) prevent sub-pixel compression shimmer.
+Under strong tensile deformation ($`\sigma_{\max}(\mathbf{J}) > \tau`$), a splat's deformed 3D covariance $`\mathbf{\Sigma}'`$ is factored via eigen-decomposition along its major axis $`\mathbf{u}_{\max}`$ and transiently split into two overlapping child Gaussians without modifying the rest-state `.ply`. Isotropic 3D Mip-Splatting and 2D EWA low-pass covariance filters ($`\mathbf{\Sigma}' + v_{\mathrm{mip}} \mathbf{I}`$, $`\mathbf{\Sigma}_{2\mathrm{D}} + v_{2\mathrm{D}} \mathbf{I}`$) prevent sub-pixel compression shimmer, while tight opacity-aware ellipse bounds ($`\sqrt{2\ln(255\,\alpha_{2\mathrm{D}})} \sqrt{\Sigma'_{ii}}`$) and exact quadratic tile intersection eliminate wasted square-box tile pairs.
 
 #### 6. 3D Mean Value Coordinates (Closed Polygonal Cages)
-In addition to tetrahedral cages, closed triangular cages (`PolyCageMesh`, loadable via Wavefront `.obj` or procedural polyhedra) evaluate smooth harmonic-like 3D Mean Value Coordinates (Ju–Schaefer–Warren) with finite-difference local Jacobians $`\mathbf{J}(\mathbf{x})`$ and optional tetrahedralization (`to_tet_mesh()`) for full GPU deformation parity.
+In addition to tetrahedral cages, closed triangular cages (`PolyCageMesh`, loadable via Wavefront `.obj` or procedural polyhedra) evaluate smooth harmonic-like 3D Mean Value Coordinates (Ju–Schaefer–Warren) with precomputed `weight_gradients` for closed-form parallel deformation Jacobians (`deform_scene_cpu`) and optional tetrahedralization (`to_tet_mesh()`) for full GPU deformation parity.
 
 ### Unified Device Model
 
-`wgpu` is pinned to `30.0.1`, matching the runtime bundled with `cubecl 0.11`. `GpuCompute` registers the presentation `wgpu::Device` and `wgpu::Queue` directly with CubeCL's compute client. As a result:
+`wgpu` is pinned to `30.0.1`, matching the runtime bundled with `cubecl 0.11`. `GpuCompute` registers the presentation `wgpu::Device` and `wgpu::Queue` directly with CubeCL's compute client via `preferred_wgpu_features(&adapter)`. As a result:
+- Hardware compute accelerators (`SHADER_F16`, `SUBGROUP`, and `TIMESTAMP_QUERY`) are enabled automatically when supported by the adapter.
 - A single hardware instance, adapter, device, and queue serve both compute dispatches and graphics presentation.
-- Memory round-trips and context synchronization bottlenecks are eliminated.
-- Compute clients are initialized once and persist for the application lifetime.
+- `GpuPipelineState` reads CubeCL's underlying `WgpuServer` resource buffer directly and records a zero-copy `copy_buffer_to_texture` straight into the `Rgba8UnormSrgb` offscreen texture.
+- Compute clients and VRAM allocations (`GpuSceneState` + `GpuFrameArena`) persist across frames with exponential growth (`1.5×`) only on capacity increases.
 
 ---
 
 ## ⚡ Measured Performance
 
-Benchmarked on `v1.0.1` via `cargo run --release --bin benchmark` under identical workload conditions:
+Benchmarked on `v2.0.0` via `cargo run --release --bin benchmark` using hardware `WGPU TIMESTAMP_QUERY` counters:
 
-- **Workload**: 100,000 synthetic Gaussians at 1920×1080 resolution (1,505,993 generated tile entries)
+- **Workload**: 100,000 synthetic Gaussians at 1920×1080 (`1,082,262` Stage 3 tile entries with tight ellipse AABBs vs `1,505,993` square-bound entries in `v1.0.1` — **28.1% fewer tile entries**)
 - **CPU**: 12 execution threads (Rayon work-stealing pool)
-- **GPU**: NVIDIA GeForce RTX 3050 Laptop GPU (Vulkan backend, CubeCL 0.11)
+- **GPU**: NVIDIA GeForce RTX 3050 Laptop GPU (`Vulkan`, CubeCL `0.11`, `SHADER_F16`, `SUBGROUP`, `TIMESTAMP_QUERY`, shared `wgpu::Device`)
 
-| Pipeline Stage | CPU Reference | CubeCL GPU (Dispatch + Readback) | Speedup |
+| Pipeline Stage | CPU Reference (`v2.0.0`) | GPU `v1.0.1` (Readback) | GPU `v2.0.0` (Dynamic Cage) | GPU `v2.0.0` Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **Stage 1 — Deformation & Polar Rot** | 5.85 ms | 10.55 ms | **0.066 ms** (`0.000 ms` static cage) | **88.6×** vs CPU / **159.8×** vs `v1.0.1` |
+| **Stage 2 — EWA Proj + Rᵀ d SH** | 1.53 ms | 7.46 ms | **0.242 ms** (`0.200 ms` orbit/static) | **6.3×** vs CPU / **30.8×** vs `v1.0.1` |
+| **Stage 3 — Prefix Scan, Radix Sort & Binning** | 46.84 ms | 30.51 ms *(CPU)* | **10.018 ms** (`6.661 ms` orbit) | **4.7×** vs CPU / **3.0×** vs `v1.0.1` |
+| **Stage 4 — Cooperative Tile Compositor** | 287.05 ms | 96.19 ms | **1.669 ms** (`1.211 ms` orbit/static) | **172.0×** vs CPU / **57.6×** vs `v1.0.1` |
+| **Sum of Active Stages** | **341.27 ms** | **144.72 ms** | **11.996 ms** *(83.4 FPS GPU time)* | **28.4×** vs CPU / **12.1×** vs `v1.0.1` |
+
+#### Persistent Pipeline & Zero-Copy End-to-End Throughput (`1920×1080`, 100k Gaussians)
+
+| Execution Mode / Workload Regime | Measured Frame Time | Throughput | Speedup vs `v1.0.1` |
 | :--- | :---: | :---: | :---: |
-| **Stage 1 — Cage Deformation** | 4.98 ms | 10.55 ms | Reference faster on small mesh |
-| **Stage 2 — EWA Projection** | 1.18 ms | 7.46 ms | Reference faster (no dispatch overhead) |
-| **Stage 3 — Tile Binning & Sort (CPU)** | 31.88 ms | 30.51 ms | Deterministic CPU sort |
-| **Stage 4 — Tile Compositor** | 250.21 ms | 96.19 ms | **2.60× GPU speedup** |
-| **Sum of Stages** | **288.25 ms** | **144.72 ms** | **1.99× aggregate speedup** |
-| **End-to-End Frame (Static View / Cached Sort)** | **268.92 ms** (3.7 FPS) | **125.35 ms** (8.0 FPS) | **2.15× total throughput** |
+| **Zero-Copy End-to-End GPU (Dynamic Cage)** *(incl. `copy_buffer_to_texture` + submit)* | **9.19 ms** | **108.9 FPS** | — |
+| **Zero-Copy End-to-End GPU (Camera Orbit)** *(incl. `copy_buffer_to_texture` + submit)* | **9.51 ms** | **105.2 FPS** | — |
+| **GPU Camera Orbit (Stationary Cage, Stage 1 skipped, `TIMESTAMP_QUERY`)** | **8.072 ms** | **123.9 FPS** | — |
+| **GPU Static View (Full Temporal Cache: Stage 1 + Stage 3 skipped)** | **1.420 ms** | **704.3 FPS** | **88.3×** vs `v1.0.1` (125.35 ms / 8.0 FPS) |
+| **CPU Reference End-to-End Frame** *(incl. upload + blit)* | **263.29 ms** | **3.8 FPS** | Baseline |
 
 > [!NOTE]
-> During static camera views or minor cage movements, the **Sort Cache** reuses Stage 3 binning structures, reducing end-to-end frame time below the raw stage summation.
+> When per-stage hardware `TIMESTAMP_QUERY` resolution is active on Dynamic Cage frames, CPU wall time is `15.729 ms` due to synchronous query readback per stage; normal rendering (`HeadlessRenderer::render_zero_copy` and interactive swapchain presentation) runs without per-stage query stalls at **9.19 ms (108.9 FPS)**. On the 1,073,930-Gaussian Mip-NeRF 360 `bonsai.ply` capture at 960×540 (`50,293` bound Gaussians, `~182k–232k` surviving splats), `record_demo` renders steady frames in `~9.3–11.1 ms` and exports the full 180-frame MP4 + GIF sequence in **`3.98s` total (`22.14 ms/frame` incl. simultaneous `ffmpeg` encoding)**.
 
 ### Criterion CPU Stage Microbenchmarks
 
@@ -173,11 +183,11 @@ Measured via `cargo bench --bench stages` (20,000 synthetic Gaussians at 1280×7
 
 | Criterion Benchmark | Median Time | 95% Confidence Interval |
 | :--- | :---: | :---: |
-| `stage1_deformation_20k` | 1.46 ms | 1.44 ms – 1.50 ms |
-| `stage2_projection_20k_720p` | 252.5 µs | 248.6 µs – 255.5 µs |
-| `stage3_binning_20k_720p` | 5.33 ms | 5.30 ms – 5.39 ms |
-| `stage4_compositor_720p` | 80.01 ms | 79.77 ms – 80.29 ms |
-| `end_to_end_cpu_720p` | 87.41 ms | 86.07 ms – 90.98 ms |
+| `stage1_deformation_20k` | 1.58 ms | 1.56 ms – 1.60 ms |
+| `stage2_projection_20k_720p` | 267.1 µs | 260.0 µs – 278.1 µs |
+| `stage3_binning_20k_720p` | 5.66 ms | 5.63 ms – 5.69 ms |
+| `stage4_compositor_720p` | 85.56 ms | 84.49 ms – 86.88 ms |
+| `end_to_end_cpu_720p` | 94.02 ms | 91.67 ms – 96.20 ms |
 
 ---
 
@@ -195,7 +205,7 @@ Measured via `cargo bench --bench stages` (20,000 synthetic Gaussians at 1280×7
 git clone https://github.com/Sadik00789/CinderGS.git
 cd CinderGS
 
-# Run unit and integration tests (167 tests)
+# Run unit and integration tests (177 tests)
 cargo test --all-targets
 
 # Strict zero-warning lint check
@@ -265,8 +275,8 @@ cargo run --release --bin record_demo -- \
     --bounds -0.15,0.43,0.50,1.15,1.10,2.00
 ```
 
-- When `ffmpeg` is present on `PATH`, the recorder outputs both `docs/cindergs_demo.mp4` and `docs/cindergs_demo.gif`.
-- If `ffmpeg` is unavailable, uncompressed PNG frames are preserved in `target/demo_frames/`.
+- When `ffmpeg` is present on `PATH`, the recorder pipes tight `RGBA8` GPU frames directly into a single-pass dual-output `ffmpeg` graph to generate `docs/cindergs_demo.mp4` and `docs/cindergs_demo.gif` simultaneously with zero PNG disk I/O (`--save-frames` keeps fast PNGs in `target/demo_frames/`).
+- If `ffmpeg` is unavailable, parallel `CompressionType::Fast` PNG frames are written to `target/demo_frames/`.
 
 ---
 
@@ -297,7 +307,7 @@ Drop any 3DGS `.ply` file onto the browser window to inspect Gaussian counts, sc
 
 ### HUD Control Panel (`egui`)
 
-- **Backend Toggle**: Switch live between `CubeCL GPU` and `CPU Reference`.
+- **Backend & Presentation**: Switch live between `CubeCL GPU` and `CPU Reference`, and toggle `VSync` (`Fifo` / `AutoNoVsync`) on the swapchain.
 - **Controls & Appearance**: Dynamically clamp `SH Degree` (0–3), adjust transient `Split Threshold` and `3D Mip Var` anti-aliasing, or toggle `Show Cage Wireframe`.
 - **Volumetric Cages**: Select active cages, adjust spring stiffness ($`k`$) and exponential damping ($`\gamma`$), pin/unpin vertex handles (`Pin / Unpin Handle`, `Clear Pins`), toggle `Ground Plane Y` collision constraints, trigger `Jiggle Impulse`, or add/remove/reset cages.
 - **Keyframe Timeline & Export**: `Bake Keyframe`, scrub playhead, play animations, write deformed 3DGS captures (`Export Deformed PLY`), and export deterministic image sequences (`Export Renders`).
@@ -336,13 +346,15 @@ CinderGS/
 │   │   ├── blit.rs         # Fullscreen sRGB presentation blit pass
 │   │   ├── camera.rs       # Camera uniforms and view-projection math
 │   │   ├── camera_path.rs  # JSON camera trajectory interpolation for batch rendering
-│   │   ├── gpu.rs          # WGPU device, queue, and swapchain initialization
-│   │   ├── gpu_bridge.rs   # CubeCL-to-WGPU buffer synchronization & IndirectDispatchArgs
-│   │   ├── gpu_pool.rs     # Persistent GPU scratch & quantized scene buffer pools
-│   │   ├── headless.rs     # Offscreen WGPU/CubeCL batch renderer
-│   │   ├── kernels/        # CubeCL GPU compute kernels (deformation, culling, compositor)
+│   │   ├── gpu.rs          # WGPU device, hardware feature negotiation & swapchain init
+│   │   ├── gpu_bridge.rs   # Standalone GPU bridge helpers, IndirectDispatchArgs & parity
+│   │   ├── gpu_pool.rs     # Persistent GPU scratch & exponential growth capacity helpers
+│   │   ├── gpu_state.rs    # Persistent VRAM GpuSceneState, GpuFrameArena & zero-copy blit
+│   │   ├── headless.rs     # Offscreen WGPU/CubeCL renderer (render, zero-copy, rgba8)
+│   │   ├── kernels/        # CubeCL kernels (binning, compositor, deformation, project, radix_sort, scan)
+│   │   ├── pipeline.rs     # Staged orchestrator connecting GPU/CPU Stages 1–5 + overlays
 │   │   ├── rasterizer/     # 16x16 tile compositor, SH math, rotation, and sort caching
-│   │   ├── tiles/          # Active-splat tile binning and 64-bit depth/tile sorting
+│   │   ├── tiles/          # Tight ellipse bounds, quadratic tile intersection & CPU binning
 │   │   └── wireframe.rs    # Dynamic cage edge and vertex handle rendering
 │   ├── scene/              # Data ingestion, quantization & analysis
 │   │   ├── autoframe.rs    # Percentile-based bounding box & camera framing
